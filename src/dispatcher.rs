@@ -27,7 +27,7 @@ use crate::ids::DispatcherId;
 use crate::reducer::Reducer;
 use crate::sink::Sink;
 
-const RETURN_TO_PENDING_DELAY: Duration = Duration::from_secs(30);
+const RETURN_TO_PENDING_DELAY: ChronoDuration = ChronoDuration::seconds(30);
 const MAX_HEALTH_PROBE_ENDPOINTS: u32 = 10;
 
 pub struct DispatcherConfig {
