@@ -19,10 +19,8 @@ pub const KIND_COMMIT_PATCH: &str = "github.commit_patch";
 pub const KIND_OPEN_PR: &str = "github.open_pr";
 
 /// All action kinds the GitHub sink handles. Mirror this in `Sink::handles()`
-/// so registration stays consistent. `KIND_OPEN_PR` lives in this file from
-/// commit A but is not added to this list until the sink dispatch is wired
-/// (commit B), to avoid `claim_actions` routing an unhandled kind.
-pub const ALL_KINDS: &[&str] = &[KIND_ENSURE_BRANCH, KIND_COMMIT_PATCH];
+/// so registration stays consistent.
+pub const ALL_KINDS: &[&str] = &[KIND_ENSURE_BRANCH, KIND_COMMIT_PATCH, KIND_OPEN_PR];
 
 /// Total file-content bytes per `commit_patch` action. Bounds outbox row size
 /// (the payload sits in SQLite). 5 MiB comfortably fits ~50 files of ~100KB

@@ -10,7 +10,8 @@ use orchestrator_core::{EndpointHint, HintExtractor};
 use serde_json::Value;
 
 use crate::action::{
-    CommitPatchPayload, EnsureBranchPayload, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH,
+    CommitPatchPayload, EnsureBranchPayload, OpenPrPayload, KIND_COMMIT_PATCH,
+    KIND_ENSURE_BRANCH, KIND_OPEN_PR,
 };
 
 pub struct GithubHintExtractor;
@@ -27,6 +28,13 @@ impl HintExtractor for GithubHintExtractor {
             }
             KIND_COMMIT_PATCH => {
                 let p: CommitPatchPayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(EndpointHint::GithubRepo {
+                    owner: p.repo.owner,
+                    name: p.repo.name,
+                })
+            }
+            KIND_OPEN_PR => {
+                let p: OpenPrPayload = serde_json::from_value(payload.clone()).ok()?;
                 Some(EndpointHint::GithubRepo {
                     owner: p.repo.owner,
                     name: p.repo.name,
@@ -86,6 +94,25 @@ mod tests {
             "ticket_id": "ENG-1",
         });
         let hint = GithubHintExtractor.extract(KIND_COMMIT_PATCH, &payload);
+        assert!(matches!(
+            hint,
+            Some(EndpointHint::GithubRepo { ref owner, ref name })
+                if owner == "octo" && name == "world"
+        ));
+    }
+
+    #[test]
+    fn extracts_repo_hint_from_open_pr_payload() {
+        let payload = json!({
+            "repo": { "owner": "octo", "name": "world" },
+            "head_branch": "auto/eng-1/abc",
+            "base_branch": "main",
+            "title": "[orch-test] eng-1",
+            "body": "",
+            "draft": false,
+            "ticket_id": "ENG-1",
+        });
+        let hint = GithubHintExtractor.extract(KIND_OPEN_PR, &payload);
         assert!(matches!(
             hint,
             Some(EndpointHint::GithubRepo { ref owner, ref name })
