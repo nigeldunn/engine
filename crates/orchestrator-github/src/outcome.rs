@@ -8,10 +8,11 @@
 use orchestrator_core::{ActionId, Causation, EventCommand, WorkflowId};
 use serde::{Deserialize, Serialize};
 
-use crate::action::{CommitPatchPayload, EnsureBranchPayload, RepoRef};
+use crate::action::{CommitPatchPayload, EnsureBranchPayload, OpenPrPayload, RepoRef};
 
 pub const EVT_BRANCH_ENSURED: &str = "github.branch_ensured.v1";
 pub const EVT_COMMIT_PUSHED: &str = "github.commit_pushed.v1";
+pub const EVT_PR_OPENED: &str = "github.pr_opened.v1";
 
 /// Outcome event payload for a successful `github.ensure_branch`.
 ///
@@ -110,6 +111,72 @@ pub fn commit_pushed_event(
         payload_type: EVT_COMMIT_PUSHED.into(),
         payload_schema_version: 1,
         payload: serde_json::to_value(&body).expect("CommitPushed serializes infallibly"),
+        causation: Causation::Action {
+            action_id: action_id.clone(),
+        },
+        trace_id: None,
+        ingress_dedup_key: None,
+    }
+}
+
+/// Outcome event payload for a successful `github.open_pr`.
+///
+/// `state` reflects the PR's state at the moment we observed it — usually
+/// `"open"` for a freshly-opened PR, but can be `"closed"` if the probe
+/// path recovered an idempotent landing of a PR that was subsequently
+/// closed by a human. Treat as observed-at-probe-time, not durable.
+///
+/// `already_existed` is true when probe (either the dispatcher's
+/// `find_existing` path or our own 422-fallback inside execute) found a
+/// PR carrying our marker, false when this attempt opened the PR fresh.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrOpened {
+    pub repo: RepoRef,
+    pub pr_number: u64,
+    pub html_url: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub head_sha: String,
+    pub base_sha: String,
+    pub draft: bool,
+    pub state: String,
+    pub action_id: ActionId,
+    pub ticket_id: String,
+    pub already_existed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn pr_opened_event(
+    workflow_id: &WorkflowId,
+    action_id: &ActionId,
+    payload: &OpenPrPayload,
+    pr_number: u64,
+    html_url: String,
+    head_sha: String,
+    base_sha: String,
+    state: String,
+    draft: bool,
+    already_existed: bool,
+) -> EventCommand {
+    let body = PrOpened {
+        repo: payload.repo.clone(),
+        pr_number,
+        html_url,
+        head_branch: payload.head_branch.clone(),
+        base_branch: payload.base_branch.clone(),
+        head_sha,
+        base_sha,
+        draft,
+        state,
+        action_id: action_id.clone(),
+        ticket_id: payload.ticket_id.clone(),
+        already_existed,
+    };
+    EventCommand {
+        workflow_id: workflow_id.clone(),
+        payload_type: EVT_PR_OPENED.into(),
+        payload_schema_version: 1,
+        payload: serde_json::to_value(&body).expect("PrOpened serializes infallibly"),
         causation: Causation::Action {
             action_id: action_id.clone(),
         },
@@ -258,5 +325,74 @@ mod tests {
         let decoded: CommitPushed = serde_json::from_value(evt.payload).unwrap();
         assert!(!decoded.is_at_head);
         assert_eq!(decoded.head_sha_at_probe, "cafef00dcafef00dcafef00dcafef00dcafef00d");
+    }
+
+    // ── pr_opened event ────────────────────────────────────────────────
+
+    use crate::action::OpenPrPayload;
+
+    fn sample_open_pr() -> OpenPrPayload {
+        OpenPrPayload {
+            repo: RepoRef {
+                owner: "octo".into(),
+                name: "world".into(),
+            },
+            head_branch: "auto/eng-1/abc".into(),
+            base_branch: "main".into(),
+            title: "[orch-test] eng-1".into(),
+            body: "Closes ENG-1.".into(),
+            draft: false,
+            ticket_id: "ENG-1".into(),
+        }
+    }
+
+    #[test]
+    fn pr_opened_event_carries_all_fields() {
+        let wf = WorkflowId::new("wf");
+        let aid = ActionId("act_pr".into());
+        let evt = pr_opened_event(
+            &wf,
+            &aid,
+            &sample_open_pr(),
+            42,
+            "https://github.com/octo/world/pull/42".into(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+            "0123456789abcdef0123456789abcdef01234567".into(),
+            "open".into(),
+            false,
+            false,
+        );
+        assert_eq!(evt.payload_type, EVT_PR_OPENED);
+        assert_eq!(evt.payload_schema_version, 1);
+        let decoded: PrOpened = serde_json::from_value(evt.payload).unwrap();
+        assert_eq!(decoded.pr_number, 42);
+        assert_eq!(decoded.html_url, "https://github.com/octo/world/pull/42");
+        assert_eq!(decoded.head_branch, "auto/eng-1/abc");
+        assert_eq!(decoded.base_branch, "main");
+        assert_eq!(decoded.state, "open");
+        assert!(!decoded.draft);
+        assert!(!decoded.already_existed);
+    }
+
+    #[test]
+    fn pr_opened_event_already_existed_flag_propagates() {
+        let wf = WorkflowId::new("wf");
+        let aid = ActionId("act_pr".into());
+        let evt = pr_opened_event(
+            &wf,
+            &aid,
+            &sample_open_pr(),
+            42,
+            "https://github.com/octo/world/pull/42".into(),
+            "0".repeat(40),
+            "1".repeat(40),
+            "closed".into(),
+            true,
+            true,
+        );
+        let decoded: PrOpened = serde_json::from_value(evt.payload).unwrap();
+        assert!(decoded.already_existed);
+        assert_eq!(decoded.state, "closed");
+        assert!(decoded.draft);
     }
 }
