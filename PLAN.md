@@ -4,22 +4,21 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
-**Milestone 8 of the GitHub sink plan: COMPLETE.**
+**Milestone 10 of the GitHub sink plan: COMPLETE.**
 
-`github.post_issue_comment` is the seventh and final v1 action — the lone CREATE-style action remaining after the M7 PATCH triple. It introduces the dual-marker idempotency strategy: HTML comment marker as primary identity, plain-text sha256 footer as fallback for stripped-HTML edge cases.
+Webhook ingestion closes the loop. New crate `orchestrator-github-webhook` provides HMAC-validated GitHub webhook receipt; the consumer's handler closure translates a `GithubWebhookDelivery` into an `EventCommand` (using `delivery_id` as `ingress_dedup_key`) and calls `executor.advance(...)`.
 
-- `action.rs` — `KIND_POST_ISSUE_COMMENT`, `PostIssueCommentPayload`, `decode_post_issue_comment`. Validates `issue_number > 0` (parameterized `validate_pr_number_with_field` for naming consistency), non-empty body capped at `MAX_PR_BODY_LEN`, non-empty ticket_id.
-- `marker.rs` — extended with `action_id_sha256_short` (4 bytes / 8 hex chars), `sha256_footer`, `append_sha256_footer` (idempotent), `matches_sha256_footer`, plus composed helpers `append_comment_markers` (HTML + sha256) and `comment_carries_marker` (HTML primary, sha256 fallback).
-- `outcome.rs` — `IssueCommentPosted` event (`github.issue_comment_posted.v1`) carries `comment_id`, `html_url`, `action_id`, `ticket_id`, and `already_existed` flag.
-- `actions/post_issue_comment.rs` — `POST /issues/{n}/comments` with marker-rewritten body. Probe paginates `GET /issues/{n}/comments?per_page=100` up to `MAX_COMMENT_PROBE_PAGES = 3`, scans bodies via `comment_carries_marker`, and returns `Err` on multi-match (collision safety bar).
-- `sha2 = "0.10"` added as a direct dep for the sha256 fallback marker.
-- `comment_id` flows into `external_ref` via the standard `finalize_succeeded` path, but probe uses scan rather than direct GET-by-id. Path-B optimization (extending `ClaimedAction` with `external_ref`) deferred — not v1-blocking.
-- 171 tests pass workspace-wide (139 lib unit + 6 github integration smoke + 26 core); `cargo clippy --all-targets -- -D warnings` clean.
-- 25 `#[ignore]`d integration tests gated on real GitHub creds: M3-M7 unchanged plus 5 M8 (happy with both markers verified, idempotent via probe scan, probe-only via HTML marker, probe-only via sha256 fallback when HTML absent, multi-match Err). Comments support DELETE so M8 cleanup is full (unlike PRs in M6/M7).
+- `crates/orchestrator-github-webhook/` — new sibling crate, library only (no binary).
+- `error.rs` — `WebhookError` with mapped HTTP statuses: 400 missing-header / malformed-signature, 403 signature-mismatch, 422 JSON-parse, 500 handler-error. axum's `DefaultBodyLimit` middleware returns 413 for over-cap bodies before our handler runs.
+- `hmac.rs` — `validate_hmac_sha256(secret, raw_body, header)` with constant-time compare via `subtle::ConstantTimeEq`. Strict `sha256=` prefix; hex-decode; HMAC over **raw body bytes** (router uses axum's `Bytes` extractor, never `Json`).
+- `delivery.rs` — `GithubWebhookDelivery { event_type, delivery_id, action, payload }`. Payload kept opaque (`serde_json::Value`); `action` pre-extracted from `payload.action` for ergonomic `(event_type, action)` pattern matching by the consumer. Typing out 30+ GitHub event variants would be premature; M11 reducer decodes what it needs.
+- `router.rs` — `router(GithubWebhookConfig, handler) -> axum::Router`. Single `POST /` endpoint; mountable under any prefix via `Router::nest`. Handler closure is opaque-error (`E: Display`) — surfaces as 500 with the error logged.
+- 29 tests pass (17 unit on hmac + delivery, 12 integration via `tower::ServiceExt::oneshot` covering all status code paths). No `#[ignore]`d tests — fully self-contained, no real network bind.
+- 200 tests pass workspace-wide (was 171 after M8; +29). `cargo clippy --all-targets -- -D warnings` clean.
 
-**v1 GitHub action surface complete.** All 7 action kinds wired:
-`ensure_branch`, `commit_patch`, `open_pr`, `update_pr_metadata`,
-`set_pr_status`, `close_pr`, `post_issue_comment`.
+**Workflow routing scope.** The webhook crate is transport-only. Mapping a delivery to a `workflow_id` lives in the consumer's translation closure — the crate has no opinion about which workflow a given delivery belongs to. M11 (the workflow reducer) and the eventual app binary own that wiring.
+
+**v1 GitHub surface complete.** Action surface (M3-M8) + ingress (M10). Outstanding: M11 (real workflow reducer) and M12 (agent runner sinks).
 
 ## GitHub sink HTTP-status classification
 
@@ -77,16 +76,6 @@ Deferred from v1:
 - `github.post_review_comment` (inline comments — diff position validity adds complexity)
 - `github.update_pr_branch` (atomic multi-commit — reducer emits separate `commit_patch` actions instead)
 - `github.merge_pr` (humans merge; orchestrator observes via webhook)
-
-### Milestone 10: Webhook ingestion
-
-Separate concern from the sink. An HTTP server (axum or similar) that:
-- Receives GitHub webhook deliveries
-- Validates HMAC signatures
-- Translates webhook events into `EventCommand`s with `ingress_dedup_key = delivery_id`
-- Calls `executor.advance(...)`
-
-This is what closes the loop: orchestrator opens PR → human merges → webhook arrives → workflow advances to "merged" state.
 
 ### Milestone 11: The actual coding workflow reducer
 
@@ -160,3 +149,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 6 (github.open_pr): POST /pulls with marker-rewritten body (HTML comment `<!-- orchestrator-action: {id} -->` always appended at end of body). 422-fallback probe paginates list-pulls filtered by `head={owner}:{branch}&state=all`. Multi-marker matches → Err per the collision safety bar. state field on outcome captures observed-at-probe-time so closed-PR recovery is visible to reducers. 135 tests workspace-wide; 5 #[ignore]d integration tests covering happy, idempotent, probe-only, non-orchestrator collision, and closed-PR recovery.
 - Milestone 7 (PATCH triple — update_pr_metadata + set_pr_status + close_pr): three orchestrator-owned, last-write-wins actions. No probe (find_existing returns Ok(None)); idempotent via PATCH semantics on the GitHub side. Outcome events record applied state from response, not echoed intent. set_pr_status makes up to two calls (PATCH draft, POST /requested_reviewers); last response is canonical. 152 tests workspace-wide; 5 #[ignore]d integration tests covering update + idem, set draft, close + idem.
 - Milestone 8 (github.post_issue_comment): seventh and final v1 action. Dual-marker idempotency — HTML primary `<!-- orchestrator-action: {id} -->`, plain-text sha256 footer `[orch:{8 hex}]` as stripped-HTML-tolerant fallback. Probe scans `GET /issues/{n}/comments` paginated up to MAX_COMMENT_PROBE_PAGES=3 and matches either marker form; multi-match → Err per collision safety bar. comment_id flows to external_ref via finalize_succeeded but probe uses scan (Path-B direct lookup deferred). 171 tests workspace-wide; 5 #[ignore]d integration tests covering happy with both markers, idempotent via probe scan, probe-only via HTML marker, probe-only via sha256 fallback, and multi-match Err. **v1 GitHub action surface complete (all 7 kinds wired).**
+- Milestone 10 (orchestrator-github-webhook crate): HMAC-validated webhook ingestion. New library crate provides `router(config, handler) -> axum::Router` with HMAC-SHA256 over raw body bytes (Bytes extractor, never Json), constant-time compare via subtle, GithubWebhookDelivery handed to consumer's translation closure. HTTP status codes: 400 missing-header / malformed-signature, 403 signature-mismatch, 422 JSON-parse, 500 handler-error (413 from axum's DefaultBodyLimit). Workflow routing is the consumer's concern. 200 tests workspace-wide; 29 new (17 unit + 12 integration via tower::ServiceExt::oneshot, no real network bind). Closes the loop: orchestrator opens PR → human merges → webhook → workflow advances.
