@@ -4,57 +4,70 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
-**Milestone 2 of the GitHub sink plan: COMPLETE.**
+**Milestone 3 of the GitHub sink plan: COMPLETE.**
 
-The reducer-side helpers are in place. On top of the v2 contract from M1, `orchestrator-core` now exposes:
+The repo is now a Cargo workspace at `/Cargo.toml` (`members = ["crates/*"]`) with two crates:
 
-- `slugify(input, max_len) -> String` (`src/slug.rs`) — branch-safe slugs with deterministic blake3 hash-suffix truncation. Empty / all-stripped input falls back to an opaque hash so output is always non-empty and deterministic.
-- `ActionBuilder` + `ActionRef` (`src/action_builder.rs`) — kind-coupled builder. `push(action)` derives the `ActionId` from the action's own `kind` and its index in the builder's vec, returning a ref whose embedded id cannot drift from the outbox row `Storage::advance` will create. `peek_id(kind)` for the case where the id must be known before payload construction.
-- Both re-exported from `lib.rs`.
-- 26 tests pass: 17 unit + 2 new integration (round-tripping through `Storage::advance`) + 7 existing E2E. `cargo clippy -- -D warnings` clean.
+- `crates/orchestrator-core/` — unchanged from M2 except for the path move.
+- `crates/orchestrator-github/` — new sibling. Skeleton only:
+  - `auth.rs` — `GithubAuth` (Mutex-cached installation tokens; refreshes 60s before expiry; PEM validated at construction).
+  - `sink.rs` — `GithubSink` impl. `handles()` empty for now; `sink_key() = "github"`; `execute()` returns `DispatcherError::Internal` defensively (M4+ extends).
+  - `health.rs` — `GET /app` probe maps to `Healthy` / `Unhealthy { Auth/Permission/Config }` / `Indeterminate` per the classification table below.
+  - `extractor.rs` — `GithubHintExtractor` stub returning `None`. M4 wires the first match arm.
+  - 6 new tests (5 unit on PEM validation + JWT signing, 1 dispatcher-registration smoke test). 1 `#[ignore]`d integration test against real GitHub gated on `GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY_PEM` / `GITHUB_INSTALLATION_ID`.
+- 32 tests pass workspace-wide; `cargo clippy --all-targets -- -D warnings` clean.
+
+## GitHub sink HTTP-status classification
+
+Shared policy for all `github.*` action kinds (M4-M9). Per-action deviations must be documented in their milestone section.
+
+**Important:** `Sink::find_existing` is the *only* place where the distinction between "probe says it didn't happen" (`Ok(None)`) and "probe couldn't tell" (`Err(...)`) is encoded. The dispatcher's CLAUDE.md rule #4 forbids executing on `Err(...)`. Conflate them and we silently double-execute side effects on real outages. When in doubt, return `Err(...)`.
+
+### `Sink::execute` mapping
+
+| HTTP outcome                          | `AttemptOutcome`                                                |
+|---------------------------------------|-----------------------------------------------------------------|
+| 200 / 201 / 204 (action-specific)     | `Succeeded { ... }`                                             |
+| 401 Unauthorized                      | `SinkUnhealthy { AuthenticationFailed }`                        |
+| 403 (rate-limit / abuse detection)    | `TransientFail` — honour `Retry-After` / `X-RateLimit-Reset`    |
+| 403 (permission denied)               | `SinkUnhealthy { PermissionDenied }`                            |
+| 404 on workflow precondition          | `PermanentFail` (e.g., base branch missing — needs human)       |
+| 404 on a target we just created       | `TransientFail` (eventual consistency)                          |
+| 409 Conflict                          | `PermanentFail`                                                 |
+| 422 "Reference already exists"        | Per-action: `execute` invokes `find_existing` and translates    |
+| 422 Validation / non-fast-forward     | `PermanentFail`                                                 |
+| 429 Too Many Requests                 | `TransientFail` — honour `Retry-After`                          |
+| 5xx / network / timeout               | `TransientFail`                                                 |
+
+### `Sink::find_existing` mapping (probe)
+
+| HTTP outcome                          | Result                                                          |
+|---------------------------------------|-----------------------------------------------------------------|
+| 200, marker matches                   | `Ok(Some(ExistingResult { ... }))`                              |
+| 200, marker absent                    | `Ok(None)` — execute may proceed                                |
+| 200, conflicting state                | `Err(...)` — probe failed; do NOT execute                       |
+| 404                                   | `Ok(None)` — definitively did not happen                        |
+| 401 / 403 / 5xx / network             | `Err(...)` — probe failed; do NOT execute                       |
+
+### `Sink::check_health` mapping
+
+| HTTP outcome on `GET /app`            | `SinkHealthState`                                               |
+|---------------------------------------|-----------------------------------------------------------------|
+| 200                                   | `Healthy`                                                       |
+| 401                                   | `Unhealthy { AuthenticationFailed }`                            |
+| 403                                   | `Unhealthy { PermissionDenied }`                                |
+| Other 4xx                             | `Unhealthy { ConfigurationInvalid }`                            |
+| 5xx / network / timeout               | `Indeterminate`                                                 |
+
+### Notes / deferred work
+
+- **Secondary rate limits** (abuse detection): GitHub returns 403 with a back-off hint. Treat as `TransientFail`, not unhealthy — they're per-token throttling, not auth issues.
+- **Rate-limit-aware backoff**: `Retry-After` and `X-RateLimit-Reset` should drive the transient backoff schedule. M4 may ship with the default exponential backoff; rate-limit-aware backoff is a deferred TODO before significant production load.
+- **422 "Reference already exists"** specifically: `ensure_branch::execute` interprets this as "branch exists; verify via probe" and immediately calls its own `find_existing` to translate the result. Other 422s are `PermanentFail`.
 
 ## What's next
 
 Implementation order, each item independently mergeable:
-
-### Milestone 3: `orchestrator-github` crate skeleton
-
-Create a new crate (sibling, in a workspace).
-
-**Cargo.toml workspace setup:**
-
-```toml
-# /Cargo.toml (workspace root)
-[workspace]
-members = ["crates/orchestrator-core", "crates/orchestrator-github"]
-```
-
-This requires moving the existing crate to `crates/orchestrator-core/`. Be careful with `Cargo.lock` and the test binary path.
-
-**`orchestrator-github` initial shape:**
-
-```
-crates/orchestrator-github/
-├── Cargo.toml
-└── src/
-    ├── lib.rs
-    ├── auth.rs           # GitHub App auth helper
-    ├── sink.rs           # GithubSink struct, Sink impl skeleton
-    ├── health.rs         # check_health implementation
-    ├── extractor.rs      # GithubHintExtractor for SinkHealthScope
-    ├── action.rs         # GithubAction enum and payload types
-    └── outcome.rs        # outcome event types
-```
-
-**Dependencies:**
-- `orchestrator-core = { path = "../orchestrator-core" }`
-- `octocrab = "0.x"` (latest)
-- `tokio`, `serde`, `serde_json`, `chrono`, `tracing`, `async-trait`, `thiserror`
-- `blake3`, `hex`, `sha2` (for body digests)
-
-**Initial sink:** registers no action kinds yet. `check_health` does the global App auth probe but no per-repo probe (no kinds → no scope → nothing to probe). Health implementation in §6.2 of the v5 design (in conversation history).
-
-**Acceptance:** crate compiles, registers with the dispatcher, `check_health` works, nothing else implemented.
 
 ### Milestone 4: `github.ensure_branch`
 
@@ -234,3 +247,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 
 - Milestone 1 (orchestrator-core v2 contract): complete with 7 passing tests.
 - Milestone 2 (slugify + ActionBuilder helpers): kind-coupled builder eliminates the embedded-id-vs-outbox-row drift footgun; round-trip test verifies multi-action ordering through `Storage::advance`. 26 tests pass.
+- Milestone 3 (orchestrator-github skeleton): workspace split, `GithubAuth` with PEM validation + Mutex token cache, `GithubSink` registers cleanly, `check_health` probes `GET /app` per the classification table. 32 tests pass; integration test `#[ignore]`d behind real GitHub credentials. action.rs/outcome.rs deferred to M4.
