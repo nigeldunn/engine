@@ -29,10 +29,24 @@ use crate::state::{
 };
 
 const MAX_BRANCH_SLUG_LEN: usize = 60;
+/// Default retry budget for github.* actions: fast HTTP calls, transient
+/// failures usually clear within a few minutes.
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
-/// Matches the schema default and existing fast-sink behavior. M12b's
-/// reducer updates bumps this per agent kind for slow-running sinks.
 const DEFAULT_MAX_PROBE_ATTEMPTS: u32 = 20;
+
+/// Coder runs are the slowest agent in the v1 contract — code generation
+/// over potentially many files can run 5-15 minutes per attempt. With
+/// `max_attempts = 50` and the default exponential backoff capping at
+/// 5 minutes, total wait is 4-5 hours before permanent failure. Probe
+/// budget similarly extended.
+const CODER_MAX_ATTEMPTS: u32 = 50;
+const CODER_MAX_PROBE_ATTEMPTS: u32 = 60;
+
+/// Other agents (triage, planner, reviewer, security) are typically
+/// faster — single-digit minutes per attempt. 20 attempts gives ~1-2
+/// hours of budget under the default backoff schedule.
+const AGENT_MAX_ATTEMPTS: u32 = 20;
+const AGENT_MAX_PROBE_ATTEMPTS: u32 = 40;
 
 // We're also subscribed to github outcome events emitted by the github sink.
 const EVT_GH_BRANCH_ENSURED: &str = orchestrator_github::EVT_BRANCH_ENSURED;
@@ -475,8 +489,8 @@ fn build_triage_action(event: &EventEnvelope, state: &WorkflowState) -> Action {
         kind: KIND_AGENT_TRIAGE.into(),
         payload,
         delay_seconds: 0,
-        max_attempts: DEFAULT_MAX_ATTEMPTS,
-        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
+        max_attempts: AGENT_MAX_ATTEMPTS,
+        max_probe_attempts: AGENT_MAX_PROBE_ATTEMPTS,
     }
     .with_event_for_id_check(event)
 }
@@ -490,8 +504,8 @@ fn build_planner_action(event: &EventEnvelope, state: &WorkflowState) -> Action 
         kind: KIND_AGENT_PLANNER.into(),
         payload,
         delay_seconds: 0,
-        max_attempts: DEFAULT_MAX_ATTEMPTS,
-        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
+        max_attempts: AGENT_MAX_ATTEMPTS,
+        max_probe_attempts: AGENT_MAX_PROBE_ATTEMPTS,
     }
     .with_event_for_id_check(event)
 }
@@ -556,8 +570,8 @@ fn build_coder_action(_event: &EventEnvelope, state: &WorkflowState) -> Action {
         kind: KIND_AGENT_CODER.into(),
         payload,
         delay_seconds: 0,
-        max_attempts: DEFAULT_MAX_ATTEMPTS,
-        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
+        max_attempts: CODER_MAX_ATTEMPTS,
+        max_probe_attempts: CODER_MAX_PROBE_ATTEMPTS,
     }
 }
 
@@ -627,8 +641,8 @@ fn build_reviewer_action(_event: &EventEnvelope, state: &WorkflowState) -> Actio
         kind: KIND_AGENT_REVIEWER.into(),
         payload,
         delay_seconds: 0,
-        max_attempts: DEFAULT_MAX_ATTEMPTS,
-        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
+        max_attempts: AGENT_MAX_ATTEMPTS,
+        max_probe_attempts: AGENT_MAX_PROBE_ATTEMPTS,
     }
 }
 
@@ -643,8 +657,8 @@ fn build_security_reviewer_action(_event: &EventEnvelope, state: &WorkflowState)
         kind: KIND_AGENT_SECURITY_REVIEWER.into(),
         payload,
         delay_seconds: 0,
-        max_attempts: DEFAULT_MAX_ATTEMPTS,
-        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
+        max_attempts: AGENT_MAX_ATTEMPTS,
+        max_probe_attempts: AGENT_MAX_PROBE_ATTEMPTS,
     }
 }
 
