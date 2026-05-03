@@ -9,7 +9,7 @@ use orchestrator_core::{
 };
 use std::sync::Arc;
 
-use crate::action::{ALL_KINDS, KIND_ENSURE_BRANCH};
+use crate::action::{ALL_KINDS, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH};
 use crate::actions;
 use crate::auth::GithubAuth;
 use crate::health;
@@ -57,6 +57,7 @@ impl Sink for GithubSink {
     ) -> Result<Option<ExistingResult>, DispatcherError> {
         match action.kind.as_str() {
             KIND_ENSURE_BRANCH => actions::ensure_branch::probe(&self.auth, action).await,
+            KIND_COMMIT_PATCH => actions::commit_patch::probe(&self.auth, action).await,
             other => Err(DispatcherError::Internal(format!(
                 "github sink: no probe for unhandled kind '{}'",
                 other
@@ -70,6 +71,7 @@ impl Sink for GithubSink {
     ) -> Result<AttemptOutcome, DispatcherError> {
         match action.kind.as_str() {
             KIND_ENSURE_BRANCH => actions::ensure_branch::execute(&self.auth, action).await,
+            KIND_COMMIT_PATCH => actions::commit_patch::execute(&self.auth, action).await,
             other => Err(DispatcherError::Internal(format!(
                 "github sink: no executor for unhandled kind '{}'",
                 other

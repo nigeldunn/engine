@@ -1,7 +1,9 @@
 //! Verify GithubSink can be constructed and registered with a Dispatcher.
 
 use orchestrator_core::*;
-use orchestrator_github::{GithubAuth, GithubHintExtractor, GithubSink, KIND_ENSURE_BRANCH};
+use orchestrator_github::{
+    GithubAuth, GithubHintExtractor, GithubSink, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -40,7 +42,7 @@ async fn github_sink_registers_with_dispatcher() {
     // Sanity: trait surface. handles() is ALL_KINDS — extends as more
     // action kinds land.
     assert_eq!(sink.sink_key(), "github");
-    assert_eq!(sink.handles(), &[KIND_ENSURE_BRANCH]);
+    assert_eq!(sink.handles(), &[KIND_ENSURE_BRANCH, KIND_COMMIT_PATCH]);
 
     // Register with a real Dispatcher. If the trait shape didn't match,
     // this wouldn't compile.

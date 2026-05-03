@@ -9,7 +9,9 @@
 use orchestrator_core::{EndpointHint, HintExtractor};
 use serde_json::Value;
 
-use crate::action::{EnsureBranchPayload, KIND_ENSURE_BRANCH};
+use crate::action::{
+    CommitPatchPayload, EnsureBranchPayload, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH,
+};
 
 pub struct GithubHintExtractor;
 
@@ -18,6 +20,13 @@ impl HintExtractor for GithubHintExtractor {
         match action_kind {
             KIND_ENSURE_BRANCH => {
                 let p: EnsureBranchPayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(EndpointHint::GithubRepo {
+                    owner: p.repo.owner,
+                    name: p.repo.name,
+                })
+            }
+            KIND_COMMIT_PATCH => {
+                let p: CommitPatchPayload = serde_json::from_value(payload.clone()).ok()?;
                 Some(EndpointHint::GithubRepo {
                     owner: p.repo.owner,
                     name: p.repo.name,
@@ -64,5 +73,23 @@ mod tests {
         assert!(GithubHintExtractor
             .extract(KIND_ENSURE_BRANCH, &payload)
             .is_none());
+    }
+
+    #[test]
+    fn extracts_repo_hint_from_commit_patch_payload() {
+        let payload = json!({
+            "repo": { "owner": "octo", "name": "world" },
+            "branch": "auto/eng-1/abc",
+            "expected_parent_sha": "0123456789abcdef0123456789abcdef01234567",
+            "commit_message": "fix",
+            "files": [{ "path": "x", "content": "y" }],
+            "ticket_id": "ENG-1",
+        });
+        let hint = GithubHintExtractor.extract(KIND_COMMIT_PATCH, &payload);
+        assert!(matches!(
+            hint,
+            Some(EndpointHint::GithubRepo { ref owner, ref name })
+                if owner == "octo" && name == "world"
+        ));
     }
 }

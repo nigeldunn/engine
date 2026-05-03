@@ -4,19 +4,18 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
-**Milestone 4 of the GitHub sink plan: COMPLETE.**
+**Milestone 5 of the GitHub sink plan: COMPLETE.**
 
-`github.ensure_branch` is the first real action kind. The skeleton from M3 is now wired:
+`github.commit_patch` is the second action kind — push a multi-file commit onto a branch via the Git Data API, idempotent on retries, recoverable from crashes between the commit-create and ref-update steps.
 
-- `action.rs` — `RepoRef`, `EnsureBranchPayload`, `decode_ensure_branch` (serde + structural validation). Validation rejects malformed owners/repo names/branch names/SHAs at the dispatcher boundary so a buggy reducer becomes a fast `PermanentFail`, not a confusing GitHub 422 down the line.
-- `outcome.rs` — `BranchEnsured` event payload (`github.branch_ensured.v1`) with `already_existed: bool` to distinguish "we created it" from "we observed prior partial success".
-- `client.rs` — shared `installation_client` / `app_client` builders so M5+ doesn't grow a parallel auth path.
-- `errors.rs` — `ErrorClass` enum + pure `classify_response(status, message)` matching the classification table; `octocrab::Error` adapter wraps it.
-- `actions/ensure_branch.rs` — `execute()` does `POST /repos/{}/{}/git/refs`, with the 422-fallback flow: `read_branch_head` translates "exists at base_sha" → `Succeeded { already_existed: true }`, "exists at different SHA" → `PermanentFail` (collision). `probe()` (called by the dispatcher's `find_existing` path) shares `read_branch_head` and returns `Err` on collision per Option 1 — fast PermanentFail via execute, slower `failed_probe_exhausted` via the dispatcher path. Documented `TODO(M5/M6)` for extending the probe return type.
-- `extractor.rs` — extracts `EndpointHint::GithubRepo` from `KIND_ENSURE_BRANCH` payloads.
-- `sink.rs` — `handles()` returns `ALL_KINDS = [KIND_ENSURE_BRANCH]`; `execute`/`find_existing` dispatch on kind; unknown kinds return `DispatcherError::Internal`.
-- 70 tests pass workspace-wide (38 in github lib unit + 6 github integration + 26 in core); `cargo clippy --all-targets -- -D warnings` clean.
-- 5 `#[ignore]`d integration tests (1 health from M3, 4 ensure_branch covering happy / idempotent / probe-only / collision) gated on `GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY_PEM` / `GITHUB_INSTALLATION_ID` / `GITHUB_TEST_REPO_OWNER` / `GITHUB_TEST_REPO_NAME`.
+- `action.rs` — `KIND_COMMIT_PATCH`, `CommitAuthor`, `FileChange`, `CommitPatchPayload`, `decode_commit_patch`. Validation rejects unsafe paths (`..`, leading `/`, `\\`, `.git/` prefix), unsupported file modes (anything outside `100644`/`100755`), and total content size over `MAX_TOTAL_CONTENT_BYTES = 5 MiB`. `validate_branch_name` parameterized so commit_patch reports under field `branch` while ensure_branch keeps `branch_name`.
+- `outcome.rs` — `CommitPushed` event (`github.commit_pushed.v1`) carries `commit_sha`, `parent_sha`, `is_at_head`, `head_sha_at_probe`, and `files_changed` for downstream reducers.
+- `trailer.rs` — `append_action_id_trailer` follows PLAN.md's literal rule (always a fresh trailer paragraph). `extract_action_id_trailer` scans only the *last* paragraph so an `Action-Id:` line in the body cannot spoof a probe match.
+- `actions/commit_patch.rs` — six API calls (read branch head → read parent commit → POST blobs → POST tree → POST commit with trailer → PATCH ref). Step 1 head-mismatch and step 6 fast-forward failures both route through `probe()` so a successful step-6-but-no-outcome-write crash recovers cleanly on retry. Probe scans the last `MAX_HISTORY_DEPTH = 50` commits via `GET /commits?sha={branch}&per_page=50`, comparing trailer values. `is_at_head` is determined by string-comparing `commit_sha` to `head_sha`, not by list-index position.
+- `extractor.rs` — second match arm extracts `EndpointHint::GithubRepo` from `commit_patch` payloads.
+- `sink.rs` — dispatches `KIND_COMMIT_PATCH` to `actions::commit_patch::*`; `ALL_KINDS = [KIND_ENSURE_BRANCH, KIND_COMMIT_PATCH]`.
+- 108 tests pass workspace-wide (76 lib unit + 6 github integration smoke + 26 core); `cargo clippy --all-targets -- -D warnings` clean.
+- 10 `#[ignore]`d integration tests gated on real GitHub creds: 1 health (M3), 4 ensure_branch (M4), 5 commit_patch (M5: single-file, multi-file, idempotent recovery via probe, buried-commit probe, concurrent-advance PermanentFail).
 
 ## GitHub sink HTTP-status classification
 
@@ -69,45 +68,6 @@ Shared policy for all `github.*` action kinds (M4-M9). Per-action deviations mus
 ## What's next
 
 Implementation order, each item independently mergeable:
-
-### Milestone 5: `github.commit_patch` via Git Data API
-
-The most complex action. Use the Git Data API flow:
-
-```
-1. GET /repos/{repo}/git/ref/heads/{branch}
-   - Verify head == expected_parent_sha (else PermanentFail)
-2. GET /repos/{repo}/git/commits/{ref_sha}
-   - Capture tree SHA
-3. POST /repos/{repo}/git/blobs (one per file upsert)
-4. POST /repos/{repo}/git/trees
-   - base_tree = tree from step 2
-   - tree[].mode = "100644" for files, sha = blob SHA from step 3
-   - sha = null for deletions
-5. POST /repos/{repo}/git/commits
-   - parents = [expected_parent_sha]
-   - message = "{commit_message}\n\nAction-Id: {action_id}"
-6. PATCH /repos/{repo}/git/refs/heads/{branch}
-   - sha = new commit SHA
-   - force = false (refuse non-fast-forward)
-```
-
-Step 6 is the transactional unit. Crashes between 3 and 6 leave dangling blobs/trees/commits that GitHub GCs.
-
-**Probe** scans recent branch commits up to `MAX_HISTORY_DEPTH = 50` looking for the `Action-Id` trailer. Returns:
-- `Ok(Some(...))` if found, with `is_at_head: bool` indicating whether our commit is currently HEAD
-- `Ok(None)` if branch HEAD == expected_parent_sha (commit didn't land) OR scanned MAX_HISTORY_DEPTH without finding (indeterminate within bound — execute will discover via fast-forward failure if our commit was actually buried)
-- `Err(...)` if a probe API call failed
-
-**Outcome event:** `github.commit_pushed.v1` with `commit_sha`, `parent_sha`, `is_at_head`, `head_sha_at_probe`, `files_changed`, `action_id`.
-
-**Tests:**
-- Single-file commit happy path
-- Multi-file commit (3+ files)
-- File deletion (sha = null)
-- Crash between commit creation and ref update → probe finds our commit at HEAD on retry
-- Concurrent commit lands on top → probe finds our commit buried; outcome has `is_at_head: false`
-- Branch advanced beyond our `expected_parent_sha` → execute fails 422 fast-forward; classified permanent
 
 ### Milestone 6: `github.open_pr`
 
@@ -210,3 +170,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 2 (slugify + ActionBuilder helpers): kind-coupled builder eliminates the embedded-id-vs-outbox-row drift footgun; round-trip test verifies multi-action ordering through `Storage::advance`. 26 tests pass.
 - Milestone 3 (orchestrator-github skeleton): workspace split, `GithubAuth` with PEM validation + Mutex token cache, `GithubSink` registers cleanly, `check_health` probes `GET /app` per the classification table. 32 tests pass; integration test `#[ignore]`d behind real GitHub credentials. action.rs/outcome.rs deferred to M4.
 - Milestone 4 (github.ensure_branch): first real action kind. POST /git/refs with 422-fallback probe; collision returns Err from probe (Option 1) and PermanentFail from execute. Shared error classifier + client builder for M5+. 70 tests workspace-wide; 4 #[ignore]d integration tests gated on test-repo env vars.
+- Milestone 5 (github.commit_patch): six-step Git Data flow with Action-Id trailer for probe identity. Step-1 head-mismatch and step-6 fast-forward failure both route through probe to recover from "we landed but the outcome event didn't write" crash cases. is_at_head distinguishes "still HEAD" from "buried under a later commit". 108 tests workspace-wide; 5 #[ignore]d integration tests covering single-file, multi-file (upsert/modify/delete), idempotent recovery, buried-commit, and concurrent-advance.

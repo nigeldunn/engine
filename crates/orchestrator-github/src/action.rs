@@ -16,10 +16,8 @@ pub const KIND_ENSURE_BRANCH: &str = "github.ensure_branch";
 pub const KIND_COMMIT_PATCH: &str = "github.commit_patch";
 
 /// All action kinds the GitHub sink handles. Mirror this in `Sink::handles()`
-/// so registration stays consistent. `KIND_COMMIT_PATCH` lives in this file
-/// from commit A but is not added to this list until the sink dispatch is
-/// wired (commit B).
-pub const ALL_KINDS: &[&str] = &[KIND_ENSURE_BRANCH];
+/// so registration stays consistent.
+pub const ALL_KINDS: &[&str] = &[KIND_ENSURE_BRANCH, KIND_COMMIT_PATCH];
 
 /// Total file-content bytes per `commit_patch` action. Bounds outbox row size
 /// (the payload sits in SQLite). 5 MiB comfortably fits ~50 files of ~100KB
