@@ -4,17 +4,22 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
-**Milestone 7 of the GitHub sink plan: COMPLETE.**
+**Milestone 8 of the GitHub sink plan: COMPLETE.**
 
-The PATCH triple — `update_pr_metadata`, `set_pr_status`, `close_pr` — adds three orchestrator-owned, last-write-wins actions on existing PRs. No probe; the dispatcher's retry-on-TransientFail is sufficient for crash recovery, and PATCH semantics are idempotent on the GitHub side.
+`github.post_issue_comment` is the seventh and final v1 action — the lone CREATE-style action remaining after the M7 PATCH triple. It introduces the dual-marker idempotency strategy: HTML comment marker as primary identity, plain-text sha256 footer as fallback for stripped-HTML edge cases.
 
-- `action.rs` — `KIND_UPDATE_PR_METADATA`, `KIND_SET_PR_STATUS`, `KIND_CLOSE_PR`. Three payload structs with validation: `update_pr_metadata` requires ≥1 of title/body, `set_pr_status` requires ≥1 of draft/reviewers (≤ `MAX_REQUESTED_REVIEWERS = 15`), `close_pr` validates pr_number > 0. `validate_owner` parameterized so reviewers validate under `requested_reviewers[]` field. `validate_pr_number` shared across all three.
-- `outcome.rs` — `PrMetadataUpdated`, `PrStatusSet`, `PrClosed` events. Each records *applied* state from the response, not echoed intent (matching the convention from `open_pr`/`commit_patch`).
-- `actions/{update_pr_metadata,set_pr_status,close_pr}.rs` — small `execute()`-only modules. `set_pr_status` makes up to two API calls (PATCH for draft, POST /requested_reviewers for reviewers); the last response provides canonical state for the outcome.
-- `sink.rs` — three new dispatch arms; `find_existing` returns `Ok(None)` for the PATCH triple (explicit, documented as last-write-wins).
-- `extractor.rs` — three new match arms, all producing `EndpointHint::GithubRepo`.
-- 152 tests pass workspace-wide (120 lib unit + 6 github integration smoke + 26 core); `cargo clippy --all-targets -- -D warnings` clean.
-- 20 `#[ignore]`d integration tests gated on real GitHub creds: M3-M6 unchanged plus 5 M7 (update happy + idempotent, set_pr_status draft toggle, close_pr happy + idempotent).
+- `action.rs` — `KIND_POST_ISSUE_COMMENT`, `PostIssueCommentPayload`, `decode_post_issue_comment`. Validates `issue_number > 0` (parameterized `validate_pr_number_with_field` for naming consistency), non-empty body capped at `MAX_PR_BODY_LEN`, non-empty ticket_id.
+- `marker.rs` — extended with `action_id_sha256_short` (4 bytes / 8 hex chars), `sha256_footer`, `append_sha256_footer` (idempotent), `matches_sha256_footer`, plus composed helpers `append_comment_markers` (HTML + sha256) and `comment_carries_marker` (HTML primary, sha256 fallback).
+- `outcome.rs` — `IssueCommentPosted` event (`github.issue_comment_posted.v1`) carries `comment_id`, `html_url`, `action_id`, `ticket_id`, and `already_existed` flag.
+- `actions/post_issue_comment.rs` — `POST /issues/{n}/comments` with marker-rewritten body. Probe paginates `GET /issues/{n}/comments?per_page=100` up to `MAX_COMMENT_PROBE_PAGES = 3`, scans bodies via `comment_carries_marker`, and returns `Err` on multi-match (collision safety bar).
+- `sha2 = "0.10"` added as a direct dep for the sha256 fallback marker.
+- `comment_id` flows into `external_ref` via the standard `finalize_succeeded` path, but probe uses scan rather than direct GET-by-id. Path-B optimization (extending `ClaimedAction` with `external_ref`) deferred — not v1-blocking.
+- 171 tests pass workspace-wide (139 lib unit + 6 github integration smoke + 26 core); `cargo clippy --all-targets -- -D warnings` clean.
+- 25 `#[ignore]`d integration tests gated on real GitHub creds: M3-M7 unchanged plus 5 M8 (happy with both markers verified, idempotent via probe scan, probe-only via HTML marker, probe-only via sha256 fallback when HTML absent, multi-match Err). Comments support DELETE so M8 cleanup is full (unlike PRs in M6/M7).
+
+**v1 GitHub action surface complete.** All 7 action kinds wired:
+`ensure_branch`, `commit_patch`, `open_pr`, `update_pr_metadata`,
+`set_pr_status`, `close_pr`, `post_issue_comment`.
 
 ## GitHub sink HTTP-status classification
 
@@ -67,15 +72,6 @@ Shared policy for all `github.*` action kinds (M4-M9). Per-action deviations mus
 ## What's next
 
 Implementation order, each item independently mergeable:
-
-### Milestone 8: `github.post_issue_comment`
-
-The lone v1 action that creates a new resource (issue/PR comment) and needs marker-based probe identity. Plan from the M7-9 design review:
-
-- Marker: HTML primary (`<!-- orchestrator-action: {id} -->`), plain-text sha256 footer (`[orch:{8 hex}]`) as a stripped-HTML-tolerant fallback.
-- Probe: `GET /issues/{n}/comments?per_page=100`, paginate up to `MAX_COMMENT_PROBE_PAGES = 3`. Multi-marker → `Err` (collision safety bar).
-- Outcome `IssueCommentPosted { comment_id, html_url, ... }`. `comment_id` flows into `external_ref` via `finalize_succeeded` (durably captured) but probe uses scan, not direct lookup. Path-B optimization (extending `ClaimedAction` with `external_ref`) deferred.
-- Cleanup: comments support `DELETE /issues/comments/{id}` so M8 tests clean up fully (unlike M6/M7 PRs).
 
 Deferred from v1:
 - `github.post_review_comment` (inline comments — diff position validity adds complexity)
@@ -163,3 +159,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 5 (github.commit_patch): six-step Git Data flow with Action-Id trailer for probe identity. Step-1 head-mismatch and step-6 fast-forward failure both route through probe to recover from "we landed but the outcome event didn't write" crash cases. is_at_head distinguishes "still HEAD" from "buried under a later commit". 108 tests workspace-wide; 5 #[ignore]d integration tests covering single-file, multi-file (upsert/modify/delete), idempotent recovery, buried-commit, and concurrent-advance.
 - Milestone 6 (github.open_pr): POST /pulls with marker-rewritten body (HTML comment `<!-- orchestrator-action: {id} -->` always appended at end of body). 422-fallback probe paginates list-pulls filtered by `head={owner}:{branch}&state=all`. Multi-marker matches → Err per the collision safety bar. state field on outcome captures observed-at-probe-time so closed-PR recovery is visible to reducers. 135 tests workspace-wide; 5 #[ignore]d integration tests covering happy, idempotent, probe-only, non-orchestrator collision, and closed-PR recovery.
 - Milestone 7 (PATCH triple — update_pr_metadata + set_pr_status + close_pr): three orchestrator-owned, last-write-wins actions. No probe (find_existing returns Ok(None)); idempotent via PATCH semantics on the GitHub side. Outcome events record applied state from response, not echoed intent. set_pr_status makes up to two calls (PATCH draft, POST /requested_reviewers); last response is canonical. 152 tests workspace-wide; 5 #[ignore]d integration tests covering update + idem, set draft, close + idem.
+- Milestone 8 (github.post_issue_comment): seventh and final v1 action. Dual-marker idempotency — HTML primary `<!-- orchestrator-action: {id} -->`, plain-text sha256 footer `[orch:{8 hex}]` as stripped-HTML-tolerant fallback. Probe scans `GET /issues/{n}/comments` paginated up to MAX_COMMENT_PROBE_PAGES=3 and matches either marker form; multi-match → Err per collision safety bar. comment_id flows to external_ref via finalize_succeeded but probe uses scan (Path-B direct lookup deferred). 171 tests workspace-wide; 5 #[ignore]d integration tests covering happy with both markers, idempotent via probe scan, probe-only via HTML marker, probe-only via sha256 fallback, and multi-match Err. **v1 GitHub action surface complete (all 7 kinds wired).**

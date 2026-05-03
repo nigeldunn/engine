@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{
     ClosePrPayload, CommitPatchPayload, EnsureBranchPayload, OpenPrPayload,
-    SetPrStatusPayload, UpdatePrMetadataPayload, RepoRef,
+    PostIssueCommentPayload, SetPrStatusPayload, UpdatePrMetadataPayload, RepoRef,
 };
 
 pub const EVT_BRANCH_ENSURED: &str = "github.branch_ensured.v1";
@@ -19,6 +19,7 @@ pub const EVT_PR_OPENED: &str = "github.pr_opened.v1";
 pub const EVT_PR_METADATA_UPDATED: &str = "github.pr_metadata_updated.v1";
 pub const EVT_PR_STATUS_SET: &str = "github.pr_status_set.v1";
 pub const EVT_PR_CLOSED: &str = "github.pr_closed.v1";
+pub const EVT_ISSUE_COMMENT_POSTED: &str = "github.issue_comment_posted.v1";
 
 /// Outcome event payload for a successful `github.ensure_branch`.
 ///
@@ -314,6 +315,52 @@ pub fn pr_closed_event(
     }
 }
 
+/// Outcome event for `github.post_issue_comment`. `comment_id` is the
+/// GitHub-assigned id; the dispatcher will also write it to the outbox
+/// row's `external_ref` via `finalize_succeeded`. `already_existed` is
+/// true when probe (the dispatcher's `find_existing` path) found the
+/// comment by marker scan, false when this attempt POSTed it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueCommentPosted {
+    pub repo: RepoRef,
+    pub issue_number: u64,
+    pub comment_id: u64,
+    pub html_url: String,
+    pub action_id: ActionId,
+    pub ticket_id: String,
+    pub already_existed: bool,
+}
+
+pub fn issue_comment_posted_event(
+    workflow_id: &WorkflowId,
+    action_id: &ActionId,
+    payload: &PostIssueCommentPayload,
+    comment_id: u64,
+    html_url: String,
+    already_existed: bool,
+) -> EventCommand {
+    let body = IssueCommentPosted {
+        repo: payload.repo.clone(),
+        issue_number: payload.issue_number,
+        comment_id,
+        html_url,
+        action_id: action_id.clone(),
+        ticket_id: payload.ticket_id.clone(),
+        already_existed,
+    };
+    EventCommand {
+        workflow_id: workflow_id.clone(),
+        payload_type: EVT_ISSUE_COMMENT_POSTED.into(),
+        payload_schema_version: 1,
+        payload: serde_json::to_value(&body).expect("IssueCommentPosted serializes infallibly"),
+        causation: Causation::Action {
+            action_id: action_id.clone(),
+        },
+        trace_id: None,
+        ingress_dedup_key: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +648,59 @@ mod tests {
         let decoded: PrClosed = serde_json::from_value(evt.payload).unwrap();
         assert_eq!(decoded.state, "closed");
         assert_eq!(decoded.pr_number, 7);
+    }
+
+    // ── issue_comment_posted event ─────────────────────────────────────
+
+    use crate::action::PostIssueCommentPayload;
+
+    #[test]
+    fn issue_comment_posted_event_carries_comment_id_and_url() {
+        let wf = WorkflowId::new("wf");
+        let aid = ActionId("act_comment".into());
+        let payload = PostIssueCommentPayload {
+            repo: RepoRef {
+                owner: "octo".into(),
+                name: "world".into(),
+            },
+            issue_number: 7,
+            body: "hi".into(),
+            ticket_id: "ENG-1".into(),
+        };
+        let evt = issue_comment_posted_event(
+            &wf,
+            &aid,
+            &payload,
+            42,
+            "https://github.com/octo/world/issues/7#issuecomment-42".into(),
+            false,
+        );
+        assert_eq!(evt.payload_type, EVT_ISSUE_COMMENT_POSTED);
+        let decoded: IssueCommentPosted = serde_json::from_value(evt.payload).unwrap();
+        assert_eq!(decoded.comment_id, 42);
+        assert_eq!(
+            decoded.html_url,
+            "https://github.com/octo/world/issues/7#issuecomment-42"
+        );
+        assert_eq!(decoded.issue_number, 7);
+        assert!(!decoded.already_existed);
+    }
+
+    #[test]
+    fn issue_comment_posted_already_existed_propagates() {
+        let wf = WorkflowId::new("wf");
+        let aid = ActionId("act_comment".into());
+        let payload = PostIssueCommentPayload {
+            repo: RepoRef {
+                owner: "octo".into(),
+                name: "world".into(),
+            },
+            issue_number: 7,
+            body: "hi".into(),
+            ticket_id: "ENG-1".into(),
+        };
+        let evt = issue_comment_posted_event(&wf, &aid, &payload, 42, "url".into(), true);
+        let decoded: IssueCommentPosted = serde_json::from_value(evt.payload).unwrap();
+        assert!(decoded.already_existed);
     }
 }

@@ -28,6 +28,9 @@ thiserror = "2"
 # Tracing
 tracing = "0.1"
 
+# Hashing — sha256 fallback marker for post_issue_comment.
+sha2 = "0.10"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

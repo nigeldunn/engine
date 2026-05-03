@@ -10,8 +10,9 @@ use orchestrator_core::{EndpointHint, HintExtractor};
 use serde_json::Value;
 
 use crate::action::{
-    ClosePrPayload, CommitPatchPayload, EnsureBranchPayload, OpenPrPayload, SetPrStatusPayload,
-    UpdatePrMetadataPayload, KIND_CLOSE_PR, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH, KIND_OPEN_PR,
+    ClosePrPayload, CommitPatchPayload, EnsureBranchPayload, OpenPrPayload,
+    PostIssueCommentPayload, SetPrStatusPayload, UpdatePrMetadataPayload, KIND_CLOSE_PR,
+    KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH, KIND_OPEN_PR, KIND_POST_ISSUE_COMMENT,
     KIND_SET_PR_STATUS, KIND_UPDATE_PR_METADATA,
 };
 
@@ -57,6 +58,13 @@ impl HintExtractor for GithubHintExtractor {
             }
             KIND_CLOSE_PR => {
                 let p: ClosePrPayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(EndpointHint::GithubRepo {
+                    owner: p.repo.owner,
+                    name: p.repo.name,
+                })
+            }
+            KIND_POST_ISSUE_COMMENT => {
+                let p: PostIssueCommentPayload = serde_json::from_value(payload.clone()).ok()?;
                 Some(EndpointHint::GithubRepo {
                     owner: p.repo.owner,
                     name: p.repo.name,

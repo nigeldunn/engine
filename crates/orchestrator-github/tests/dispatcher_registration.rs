@@ -3,7 +3,8 @@
 use orchestrator_core::*;
 use orchestrator_github::{
     GithubAuth, GithubHintExtractor, GithubSink, KIND_CLOSE_PR, KIND_COMMIT_PATCH,
-    KIND_ENSURE_BRANCH, KIND_OPEN_PR, KIND_SET_PR_STATUS, KIND_UPDATE_PR_METADATA,
+    KIND_ENSURE_BRANCH, KIND_OPEN_PR, KIND_POST_ISSUE_COMMENT, KIND_SET_PR_STATUS,
+    KIND_UPDATE_PR_METADATA,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -52,6 +53,7 @@ async fn github_sink_registers_with_dispatcher() {
             KIND_UPDATE_PR_METADATA,
             KIND_SET_PR_STATUS,
             KIND_CLOSE_PR,
+            KIND_POST_ISSUE_COMMENT,
         ]
     );
 

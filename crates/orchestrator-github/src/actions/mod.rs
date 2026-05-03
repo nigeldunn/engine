@@ -5,5 +5,6 @@ pub mod close_pr;
 pub mod commit_patch;
 pub mod ensure_branch;
 pub mod open_pr;
+pub mod post_issue_comment;
 pub mod set_pr_status;
 pub mod update_pr_metadata;

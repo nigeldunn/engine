@@ -28,6 +28,9 @@ pub const KIND_SET_PR_STATUS: &str = "github.set_pr_status";
 /// Action kind: close a PR. Idempotent (closing an already-closed PR is a no-op).
 pub const KIND_CLOSE_PR: &str = "github.close_pr";
 
+/// Action kind: post a comment on an issue (or PR — same namespace).
+pub const KIND_POST_ISSUE_COMMENT: &str = "github.post_issue_comment";
+
 /// All action kinds the GitHub sink handles. Mirror this in `Sink::handles()`
 /// so registration stays consistent.
 pub const ALL_KINDS: &[&str] = &[
@@ -37,6 +40,7 @@ pub const ALL_KINDS: &[&str] = &[
     KIND_UPDATE_PR_METADATA,
     KIND_SET_PR_STATUS,
     KIND_CLOSE_PR,
+    KIND_POST_ISSUE_COMMENT,
 ];
 
 /// Total file-content bytes per `commit_patch` action. Bounds outbox row size
@@ -405,6 +409,42 @@ pub fn decode_close_pr(
     Ok(payload)
 }
 
+// ── post_issue_comment ──────────────────────────────────────────────────
+
+/// `MAX_PR_BODY_LEN` is reused for comment bodies — GitHub's hard limit
+/// is the same (~65535 chars) and the headroom for both markers
+/// (HTML + sha256 footer) fits within the existing 535-char buffer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PostIssueCommentPayload {
+    pub repo: RepoRef,
+    /// Issue number. PRs and issues share the same number namespace, so
+    /// this works for posting a comment on either.
+    pub issue_number: u64,
+    /// The comment body. The sink appends HTML + sha256 markers; the
+    /// reducer must NOT include them.
+    pub body: String,
+    pub ticket_id: String,
+}
+
+impl PostIssueCommentPayload {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        self.repo.validate()?;
+        validate_pr_number_with_field("issue_number", self.issue_number)?;
+        require_non_empty("body", &self.body, MAX_PR_BODY_LEN)?;
+        require_non_empty("ticket_id", &self.ticket_id, 250)?;
+        Ok(())
+    }
+}
+
+pub fn decode_post_issue_comment(
+    raw: &serde_json::Value,
+) -> Result<PostIssueCommentPayload, DecodeError> {
+    let payload: PostIssueCommentPayload = serde_json::from_value(raw.clone())
+        .map_err(|e| DecodeError::Serde(e.to_string()))?;
+    payload.validate()?;
+    Ok(payload)
+}
+
 // ── validators ──────────────────────────────────────────────────────────
 
 fn require_non_empty(field: &'static str, s: &str, max_len: usize) -> Result<(), DecodeError> {
@@ -456,15 +496,19 @@ fn validate_owner(s: &str) -> Result<(), DecodeError> {
 }
 
 /// PR / issue numbers must be positive.
-fn validate_pr_number(n: u64) -> Result<(), DecodeError> {
+fn validate_pr_number_with_field(field: &'static str, n: u64) -> Result<(), DecodeError> {
     if n == 0 {
         Err(DecodeError::Validation {
-            field: "pr_number",
+            field,
             detail: "must be a positive integer (got 0)".into(),
         })
     } else {
         Ok(())
     }
+}
+
+fn validate_pr_number(n: u64) -> Result<(), DecodeError> {
+    validate_pr_number_with_field("pr_number", n)
 }
 
 /// GitHub repository names: 1-100 ASCII alphanumerics + `.`, `-`, `_`.
@@ -1237,5 +1281,63 @@ mod tests {
         bad["ticket_id"] = json!("");
         let err = decode_close_pr(&bad).unwrap_err();
         assert!(matches!(err, DecodeError::Validation { field: "ticket_id", .. }));
+    }
+
+    // ── post_issue_comment validation ──────────────────────────────────
+
+    fn good_post_comment() -> serde_json::Value {
+        json!({
+            "repo": { "owner": "octo", "name": "world" },
+            "issue_number": 42,
+            "body": "Hello from the orchestrator.",
+            "ticket_id": "ENG-1",
+        })
+    }
+
+    #[test]
+    fn post_issue_comment_decodes() {
+        decode_post_issue_comment(&good_post_comment()).unwrap();
+    }
+
+    #[test]
+    fn post_issue_comment_rejects_issue_number_zero() {
+        let mut bad = good_post_comment();
+        bad["issue_number"] = json!(0);
+        let err = decode_post_issue_comment(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "issue_number", .. }));
+    }
+
+    #[test]
+    fn post_issue_comment_rejects_empty_body() {
+        let mut bad = good_post_comment();
+        bad["body"] = json!("");
+        let err = decode_post_issue_comment(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "body", .. }));
+    }
+
+    #[test]
+    fn post_issue_comment_rejects_oversized_body() {
+        let mut bad = good_post_comment();
+        bad["body"] = json!("x".repeat(MAX_PR_BODY_LEN + 1));
+        let err = decode_post_issue_comment(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "body", .. }));
+    }
+
+    #[test]
+    fn post_issue_comment_rejects_empty_ticket_id() {
+        let mut bad = good_post_comment();
+        bad["ticket_id"] = json!("");
+        let err = decode_post_issue_comment(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "ticket_id", .. }));
+    }
+
+    #[test]
+    fn post_issue_comment_round_trips_via_serde() {
+        let original = decode_post_issue_comment(&good_post_comment()).unwrap();
+        let json = serde_json::to_value(&original).unwrap();
+        let again = decode_post_issue_comment(&json).unwrap();
+        assert_eq!(original.repo, again.repo);
+        assert_eq!(original.issue_number, again.issue_number);
+        assert_eq!(original.body, again.body);
     }
 }
