@@ -1,11 +1,12 @@
 //! Storage layer. Holds the transactional invariant that events, snapshot
 //! updates, and outbox rows commit together or not at all.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::Value as Json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool, Transaction};
 use std::str::FromStr;
+use std::time::Duration;
 use tracing::{debug, instrument};
 
 use crate::action::{Action, ClaimedAction};
@@ -220,7 +221,7 @@ impl Storage {
         kinds_filter: &[&str],
     ) -> Result<Vec<ClaimedAction>, ExecutorError> {
         let now = Utc::now();
-        let lease_expires = now + lease_duration;
+        let lease_expires = now + to_chrono(lease_duration);
 
         if kinds_filter.is_empty() {
             // No healthy sinks - nothing to claim.
@@ -361,7 +362,7 @@ impl Storage {
         lease_duration: Duration,
     ) -> Result<(), ExecutorError> {
         let now = Utc::now();
-        let new_expiry = now + lease_duration;
+        let new_expiry = now + to_chrono(lease_duration);
 
         let rows = sqlx::query(
             r#"
@@ -653,7 +654,7 @@ impl Storage {
         reason: &str,
     ) -> Result<(), ExecutorError> {
         let now = Utc::now();
-        let next_at = now + retry_delay;
+        let next_at = now + to_chrono(retry_delay);
 
         let rows = sqlx::query(
             r#"
@@ -747,7 +748,7 @@ impl Storage {
         // 30s, 60s, 120s, 240s, capped at 5min.
         let backoff_secs = (30u64.saturating_mul(2u64.saturating_pow(new_probe.min(8) as u32)))
             .min(300);
-        let next_at = now + Duration::seconds(backoff_secs as i64);
+        let next_at = now + ChronoDuration::seconds(backoff_secs as i64);
 
         sqlx::query(
             r#"
@@ -784,7 +785,7 @@ impl Storage {
     ) -> Result<(), ExecutorError> {
         let now = Utc::now();
         // Default next_check 60s from now; the dispatcher will probe at this cadence.
-        let next_check = now + Duration::seconds(60);
+        let next_check = now + ChronoDuration::seconds(60);
         sqlx::query(
             r#"
             INSERT INTO sink_health (
@@ -1059,7 +1060,7 @@ async fn insert_outbox_row(
     now: DateTime<Utc>,
 ) -> Result<(), ExecutorError> {
     let payload_str = serde_json::to_string(&action.payload)?;
-    let next_at = now + Duration::seconds(action.delay_seconds as i64);
+    let next_at = now + ChronoDuration::seconds(action.delay_seconds as i64);
 
     sqlx::query(
         r#"
@@ -1108,13 +1109,20 @@ fn decode_causation(kind: &str, ref_id: Option<String>) -> Causation {
     }
 }
 
-/// Exponential backoff with jitter. Capped at ~5 minutes.
-fn backoff_duration(attempt: u32) -> Duration {
+/// Convert a std::time::Duration to chrono::Duration. Saturates on overflow,
+/// which won't happen for the values we use (minutes at most).
+fn to_chrono(d: Duration) -> ChronoDuration {
+    ChronoDuration::from_std(d).unwrap_or_else(|_| ChronoDuration::seconds(i64::MAX / 1000))
+}
+
+/// Exponential backoff with jitter. Capped at ~5 minutes. Internal helper
+/// returning chrono::Duration for direct addition to DateTime<Utc>.
+fn backoff_duration(attempt: u32) -> ChronoDuration {
     use rand::Rng;
     let base_ms: u64 = 500;
     let max_ms: u64 = 300_000;
     let exp = base_ms.saturating_mul(2u64.saturating_pow(attempt.min(10)));
     let capped = exp.min(max_ms);
     let jitter = rand::thread_rng().gen_range(0..=(capped / 4));
-    Duration::milliseconds((capped + jitter) as i64)
+    ChronoDuration::milliseconds((capped + jitter) as i64)
 }

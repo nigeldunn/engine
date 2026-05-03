@@ -10,7 +10,6 @@
 //!   - Background health-check loop probes unhealthy sinks via `check_health`
 //!     with a queue-derived scope.
 
-use chrono::Duration as ChronoDuration;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,15 +26,19 @@ use crate::ids::DispatcherId;
 use crate::reducer::Reducer;
 use crate::sink::Sink;
 
-const RETURN_TO_PENDING_DELAY: ChronoDuration = ChronoDuration::seconds(30);
 const MAX_HEALTH_PROBE_ENDPOINTS: u32 = 10;
 
 pub struct DispatcherConfig {
     pub batch_size: u32,
     pub poll_interval: Duration,
-    pub lease_duration: ChronoDuration,
+    pub lease_duration: Duration,
     pub max_concurrent_attempts: usize,
     pub health_check_interval: Duration,
+    /// How long an action waits before being eligible for re-claim after a
+    /// `SinkUnhealthy` outcome. The sink-health filter also applies, so the
+    /// action only actually runs once the sink is healthy AND this delay has
+    /// elapsed.
+    pub sink_unhealthy_retry_delay: Duration,
 }
 
 impl Default for DispatcherConfig {
@@ -43,9 +46,10 @@ impl Default for DispatcherConfig {
         Self {
             batch_size: 16,
             poll_interval: Duration::from_millis(500),
-            lease_duration: ChronoDuration::seconds(300),
+            lease_duration: Duration::from_secs(300),
             max_concurrent_attempts: 32,
             health_check_interval: Duration::from_secs(60),
+            sink_unhealthy_retry_delay: Duration::from_secs(30),
         }
     }
 }
@@ -193,11 +197,19 @@ impl<R: Reducer> Dispatcher<R> {
                 let sinks = self.sinks_by_kind.clone();
                 let dispatcher_id = self.id.clone();
                 let lease = self.config.lease_duration;
+                let unhealthy_delay = self.config.sink_unhealthy_retry_delay;
 
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) =
-                        handle_action(executor, sinks, dispatcher_id, lease, action).await
+                    if let Err(e) = handle_action(
+                        executor,
+                        sinks,
+                        dispatcher_id,
+                        lease,
+                        unhealthy_delay,
+                        action,
+                    )
+                    .await
                     {
                         error!(error = %e, "action handling failed");
                     }
@@ -232,7 +244,8 @@ async fn handle_action<R: Reducer>(
     executor: Arc<Executor<R>>,
     sinks: HashMap<&'static str, Arc<dyn Sink>>,
     dispatcher_id: DispatcherId,
-    lease_duration: ChronoDuration,
+    lease_duration: Duration,
+    sink_unhealthy_retry_delay: Duration,
     action: ClaimedAction,
 ) -> Result<(), DispatcherError> {
     let storage = executor.storage().clone();
@@ -339,7 +352,7 @@ async fn handle_action<R: Reducer>(
                 .return_to_pending(
                     &action.action_id,
                     &dispatcher_id,
-                    RETURN_TO_PENDING_DELAY,
+                    sink_unhealthy_retry_delay,
                     &format!("sink unhealthy: {}: {}", reason.as_str(), detail),
                 )
                 .await?;
@@ -382,10 +395,10 @@ fn spawn_lease_renewer(
     storage: crate::storage::Storage,
     action_id: crate::ids::ActionId,
     dispatcher_id: DispatcherId,
-    lease_duration: ChronoDuration,
+    lease_duration: Duration,
 ) -> JoinHandle<()> {
     let renew_interval =
-        Duration::from_secs(((lease_duration.num_seconds() / 3).max(10)) as u64);
+        Duration::from_secs(((lease_duration.as_secs() / 3).max(10)) as u64);
     tokio::spawn(async move {
         loop {
             sleep(renew_interval).await;

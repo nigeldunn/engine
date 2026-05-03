@@ -1,0 +1,57 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lockfile is committed for binaries (this is a binary-producing
+# workspace; the lockfile pins exact versions for reproducible builds).
+# If this becomes a library-only crate, uncomment:
+# Cargo.lock
+
+# SQLite databases (development, test, runtime)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Environment files (may contain GitHub App credentials, etc.)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Direnv
+.envrc
+.direnv/
+
+# Ad-hoc local notes that aren't part of project documentation
+NOTES.md
+SCRATCH.md
+TODO.local.md
+
+# Coverage reports
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+*.profraw
+*.profdata
+
+# Tracing/profiling output
+*.svg
+flamegraph.svg
+perf.data
+perf.data.old
+
+# OS-specific
+Thumbs.db
+desktop.ini
