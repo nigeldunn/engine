@@ -39,6 +39,7 @@ impl SinkUnhealthyReason {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // intentional: returns Option, per CLAUDE.md convention
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "authentication_failed" => Some(Self::AuthenticationFailed),
@@ -103,6 +104,7 @@ impl PersistedHealthState {
             Self::Unhealthy => "unhealthy",
         }
     }
+    #[allow(clippy::should_implement_trait)] // intentional: returns Option, per CLAUDE.md convention
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "healthy" => Some(Self::Healthy),

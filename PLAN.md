@@ -4,76 +4,18 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
-**Milestone 1 of the GitHub sink plan: COMPLETE.**
+**Milestone 2 of the GitHub sink plan: COMPLETE.**
 
-The `orchestrator-core` v2 contract is implemented and tested. This means:
+The reducer-side helpers are in place. On top of the v2 contract from M1, `orchestrator-core` now exposes:
 
-- Persisted sink health (`sink_health` table)
-- Separate `probe_attempt` counter on outbox rows
-- Claim doesn't burn `attempt`; outcomes do
-- `Sink::sink_key()` and `Sink::check_health()` trait methods
-- `SinkHealthState` (with `Indeterminate` variant)
-- `SinkHealthScope` and `EndpointHint` (with `Custom` variant for OSS)
-- `HintExtractor` trait and dispatcher-side registry
-- `claim_actions` filters by healthy sinks
-- Health-check loop runs in background
-- All 7 end-to-end tests pass
-
-Total codebase: ~2,800 lines of Rust.
+- `slugify(input, max_len) -> String` (`src/slug.rs`) — branch-safe slugs with deterministic blake3 hash-suffix truncation. Empty / all-stripped input falls back to an opaque hash so output is always non-empty and deterministic.
+- `ActionBuilder` + `ActionRef` (`src/action_builder.rs`) — kind-coupled builder. `push(action)` derives the `ActionId` from the action's own `kind` and its index in the builder's vec, returning a ref whose embedded id cannot drift from the outbox row `Storage::advance` will create. `peek_id(kind)` for the case where the id must be known before payload construction.
+- Both re-exported from `lib.rs`.
+- 26 tests pass: 17 unit + 2 new integration (round-tripping through `Storage::advance`) + 7 existing E2E. `cargo clippy -- -D warnings` clean.
 
 ## What's next
 
 Implementation order, each item independently mergeable:
-
-### Milestone 2: `slugify` and `ActionBuilder` helpers in `orchestrator-core`
-
-Small, pure utilities that the GitHub sink reducer will need.
-
-**`slugify`** — converts ticket IDs and other strings into git-branch-safe slugs.
-
-```rust
-// In orchestrator-core, e.g. src/slug.rs
-pub fn slugify(input: &str, max_len: usize) -> String {
-    // Lowercase ASCII alphanumeric, dashes for everything else,
-    // collapsed runs of dashes, truncated with 8-byte hash suffix
-    // if over max_len.
-}
-```
-
-Hash suffix should be 8 bytes encoded as 16 hex characters, derived from `blake3::hash(input.as_bytes())`. Reserved space: `max_len - 17` (16 hex + 1 dash) for the prefix.
-
-Tests:
-- Basic ASCII alphanumeric round-trips
-- Spaces, slashes, unicode all become dashes
-- Long strings get hash suffix
-- Determinism: same input → same slug
-
-**`ActionBuilder`** — helps reducers compute deterministic action IDs and short forms before payload construction.
-
-```rust
-pub struct ActionBuilder<'a> {
-    workflow_id: &'a WorkflowId,
-    sequence: u64,
-    next_idx: u32,
-}
-
-impl<'a> ActionBuilder<'a> {
-    pub fn new(workflow_id: &'a WorkflowId, sequence: u64) -> Self;
-    pub fn next(&mut self, kind: &str) -> ActionRef;
-}
-
-pub struct ActionRef {
-    pub action_id: ActionId,
-    pub short: String,  // first 16 chars of base32 portion
-    pub kind: String,
-}
-```
-
-The reducer uses this to embed the action_id (or its short form) in payloads — for example, branch names like `auto/{ticket_slug}/{action_short}` need to know the action_id before the action is enqueued.
-
-Both go in `orchestrator-core` because they're used by every reducer that talks to a sink with idempotency markers.
-
-**Acceptance:** unit tests pass, no public API breakage.
 
 ### Milestone 3: `orchestrator-github` crate skeleton
 
@@ -291,3 +233,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 ## Done
 
 - Milestone 1 (orchestrator-core v2 contract): complete with 7 passing tests.
+- Milestone 2 (slugify + ActionBuilder helpers): kind-coupled builder eliminates the embedded-id-vs-outbox-row drift footgun; round-trip test verifies multi-action ordering through `Storage::advance`. 26 tests pass.

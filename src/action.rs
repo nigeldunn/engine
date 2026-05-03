@@ -50,6 +50,7 @@ impl ActionState {
             Self::Cancelled => "cancelled",
         }
     }
+    #[allow(clippy::should_implement_trait)] // intentional: returns Option, per CLAUDE.md convention
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),

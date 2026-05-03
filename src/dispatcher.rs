@@ -398,7 +398,7 @@ fn spawn_lease_renewer(
     lease_duration: Duration,
 ) -> JoinHandle<()> {
     let renew_interval =
-        Duration::from_secs(((lease_duration.as_secs() / 3).max(10)) as u64);
+        Duration::from_secs((lease_duration.as_secs() / 3).max(10));
     tokio::spawn(async move {
         loop {
             sleep(renew_interval).await;
@@ -449,7 +449,7 @@ async fn health_check_loop<R: Reducer>(
             };
 
             // Build a scope from active kinds for this sink.
-            let active_kinds: Vec<&str> = sink.handles().iter().copied().collect();
+            let active_kinds: Vec<&str> = sink.handles().to_vec();
             let scope = match executor
                 .storage()
                 .build_health_scope(&active_kinds, &extractors, MAX_HEALTH_PROBE_ENDPOINTS)
@@ -504,7 +504,7 @@ pub async fn force_health_recheck<R: Reducer>(
             sink_key
         )));
     };
-    let active_kinds: Vec<&str> = sink.handles().iter().copied().collect();
+    let active_kinds: Vec<&str> = sink.handles().to_vec();
     let scope = executor
         .storage()
         .build_health_scope(&active_kinds, extractors, MAX_HEALTH_PROBE_ENDPOINTS)
