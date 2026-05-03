@@ -1,0 +1,33 @@
+[package]
+name = "orchestrator-agent-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+orchestrator-core = { path = "../orchestrator-core" }
+orchestrator-coding-workflow = { path = "../orchestrator-coding-workflow" }
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+async-trait = "0.1"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# IDs
+uuid = { version = "1", features = ["v7"] }
+
+# Errors
+thiserror = "2"
+
+# Tracing
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"

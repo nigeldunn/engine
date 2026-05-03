@@ -4,6 +4,27 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
+**Milestone 12c of the GitHub sink plan: COMPLETE.**
+
+Agent runner sinks. New crate `orchestrator-agent-runner` connects the workflow reducer's `agent.run_*` actions to actual agent services. With M12a's side-event mechanism + M12b's per-agent retry budgets + M12c's sinks, the engine can now drive a coding workflow end-to-end: reducer emits agent actions → sinks call agent services → outcome events update the workflow state → next agent action emitted.
+
+- `client.rs` — `AgentClient` trait (`run`, `status`, `health`) abstracts the agent service. Default `HttpAgentClient` POSTs `/run/{agent_type}`, GETs `/status/{agent_type}/{action_id}`, GETs `/healthz`. Optional bearer-token auth via constructor. `fresh_request_id()` generates per-HTTP UUID v7 ids.
+- `dispatch.rs` — shared `execute` / `probe` logic. Each per-agent module supplies an `AgentSpec { agent_type, category, build_outcome }` constant; dispatch handles the rest (client call, error classification, side-event emission with malformed-cost graceful fallback, request-id stamping onto `outcome_event.trace_id`).
+- `actions/{triage,planner,coder,reviewer,security_reviewer}.rs` — five per-agent specs that decode the agent's output JSON into the corresponding workflow event type and overwrite `action_id` with the dispatcher's value (so the sink can't accidentally produce an event for a different action).
+- `errors.rs` — `AgentError` enum with HTTP-status-aware classification per the M12 round-3 table.
+- `sink.rs` — `AgentRunnerSink<C: AgentClient>` generic over the client type for testability. Routes by kind to the appropriate spec; unknown kinds error defensively.
+- 18 new tests via mock `AgentClient`: happy path with cost+side-event, no-cost variants, still-running fallback, all error classifications, probe NotFound/Running/Finished, health Healthy/Unhealthy/Indeterminate, kind routing, request-id propagation.
+- 249 tests pass workspace-wide (was 231 after M12b; +18). cargo build / clippy --all-targets -- -D warnings clean.
+
+**v1 contract complete.** All five workspace crates wired:
+1. `orchestrator-core` — engine.
+2. `orchestrator-github` — outbound action surface (7 kinds).
+3. `orchestrator-github-webhook` — inbound webhook ingestion.
+4. `orchestrator-coding-workflow` — workflow reducer + event types.
+5. `orchestrator-agent-runner` — agent-service sink.
+
+The workspace can run a complete ticket-to-merged-PR cycle with real GitHub + an agent service implementing the M12 HTTP contract.
+
 **Milestone 12a of the GitHub sink plan: COMPLETE.**
 
 Core extensions to support agent-runner sinks (M12c). Two small additions:
@@ -132,16 +153,6 @@ Each item is independently mergeable. M11b's linear single-task design accommoda
 - **Failure compensation beyond halt.** On certain failure types (e.g., reviewer agent unreachable), retry a fresh agent run rather than halting outright.
 - **Cost-from-agents wiring.** M12 agent sinks emit `BudgetConsumed` events; this is the M12 contract, not M11c.
 
-### Milestone 12: Agent runner sinks
-
-The agents themselves are external services. The orchestrator's view of them is through sinks like:
-- `agent.run_planner` action → calls planner service → produces `planner_output.v1` event
-- `agent.run_coder` action → calls coder service → produces `coder_output.v1` event with patches
-- `agent.run_reviewer` action → calls reviewer service → produces `reviewer_output.v1` event with `RejectionKind`
-- etc.
-
-Each of these is structurally similar to the GitHub sink: typed payloads, idempotency via action_id, health checks. They're simpler in some ways (the external system is easier to control than GitHub) and harder in others (responses are unbounded JSON, latency is high).
-
 ## Open design questions for later
 
 These don't block current work but should be revisited when the relevant milestone arrives.
@@ -191,3 +202,6 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 10 (orchestrator-github-webhook crate): HMAC-validated webhook ingestion. New library crate provides `router(config, handler) -> axum::Router` with HMAC-SHA256 over raw body bytes (Bytes extractor, never Json), constant-time compare via subtle, GithubWebhookDelivery handed to consumer's translation closure. HTTP status codes: 400 missing-header / malformed-signature, 403 signature-mismatch, 422 JSON-parse, 500 handler-error (413 from axum's DefaultBodyLimit). Workflow routing is the consumer's concern. 200 tests workspace-wide; 29 new (17 unit + 12 integration via tower::ServiceExt::oneshot, no real network bind). Closes the loop: orchestrator opens PR → human merges → webhook → workflow advances.
 - Milestone 11a (failure events + state-version migration): two small core changes that unblock the workflow reducer. New EVT_ACTION_FAILED / EVT_ACTION_PROBE_EXHAUSTED events written via executor.advance with distinct dedup-key prefixes; event-then-state ordering with dedup makes crash-recovery safe. Storage::advance discards stale snapshots and replays from event log when state_version mismatches. 214 tests workspace-wide; +14 new (failure unit + E2E + migration tests).
 - Milestone 11b (orchestrator-coding-workflow crate): linear single-task happy path with halt-on-failure + budget tracking + webhook translation. Severity is a typed enum; budget cents as u64 (deterministic replay); failure events matched by action_id (not kind). Wide-flat WorkflowState evolves via state_version. Pure-function reducer tests cover happy path + each halt path + budget guard + action_failed routing. 230 tests workspace-wide; +16 new (5 webhook + 11 reducer). Multi-task plans, review iteration, architecture step, and failure compensation deferred to M11c+.
+- Milestone 12a (side events on AttemptOutcome + per-action max_probe_attempts): two small core extensions. AttemptOutcome::Succeeded and ExistingResult gain side_events: Vec<EventCommand>; dispatcher writes outcome event first then iterates side events. Action gains max_probe_attempts (default 20). 13 outcome construction sites + 11 Action construction sites updated workspace-wide. 1 new test verifying outcome-then-side ordering. 231 tests workspace-wide.
+- Milestone 12b (per-agent-kind retry budgets): coding-workflow reducer sets max_attempts=50 / max_probe_attempts=60 for coder; 20/40 for other agents; github.* unchanged. Three named constant pairs; five builder updates. No new tests (covered by existing reducer suite). 231 tests workspace-wide.
+- Milestone 12c (orchestrator-agent-runner crate): 5 Sink impls for agent.run_* kinds via shared AgentSpec dispatch. AgentClient trait + HttpAgentClient default impl (POST /run/{type}, GET /status/{type}/{id}, GET /healthz). Per-call request_id (UUID v7) sent as X-Request-Id and stamped on outcome trace_id for local correlation. BudgetConsumed side events emitted when cost reported (zero-cost or missing-cost graceful no-op). 18 new tests via mock AgentClient cover happy/error paths, probe states, health classification, kind routing, request-id propagation. 249 tests workspace-wide.

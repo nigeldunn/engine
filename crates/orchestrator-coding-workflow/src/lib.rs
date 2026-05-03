@@ -21,11 +21,12 @@ pub use action_kinds::{
     KIND_OPEN_PR,
 };
 pub use events::{
-    BudgetConsumed, CoderOutput, FileChangeOutput, PatchOutput, PlanProposed, PrMerged,
-    ReviewerOutput, SecurityFinding, SecurityReviewerOutput, Severity, TaskSpec, TicketIngested,
-    TicketRef, TriageCompleted, EVT_BUDGET_CONSUMED, EVT_CODER_OUTPUT, EVT_PLAN_PROPOSED,
-    EVT_PR_MERGED, EVT_REVIEWER_OUTPUT, EVT_SECURITY_REVIEWER_OUTPUT, EVT_TICKET_INGESTED,
-    EVT_TRIAGE_COMPLETED,
+    budget_consumed_event, coder_output_event, plan_proposed_event, reviewer_output_event,
+    security_reviewer_output_event, triage_completed_event, BudgetConsumed, CoderOutput,
+    FileChangeOutput, PatchOutput, PlanProposed, PrMerged, ReviewerOutput, SecurityFinding,
+    SecurityReviewerOutput, Severity, TaskSpec, TicketIngested, TicketRef, TriageCompleted,
+    EVT_BUDGET_CONSUMED, EVT_CODER_OUTPUT, EVT_PLAN_PROPOSED, EVT_PR_MERGED,
+    EVT_REVIEWER_OUTPUT, EVT_SECURITY_REVIEWER_OUTPUT, EVT_TICKET_INGESTED, EVT_TRIAGE_COMPLETED,
 };
 pub use reducer::WorkflowReducer;
 pub use state::{
