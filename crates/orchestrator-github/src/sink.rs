@@ -1,24 +1,22 @@
-//! GithubSink: the `Sink` impl. M3 registers no action kinds; only the
-//! global App-auth `check_health` does real work. `execute` returns
-//! `Internal` defensively — the dispatcher should never route an unhandled
-//! kind here, but if a misconfiguration does so, we record the failure
-//! rather than panic the dispatcher task.
+//! GithubSink: the `Sink` impl. Routes each action kind to its module under
+//! `actions::*`. `check_health` keeps the M3 global App-auth probe; per-repo
+//! probes can be added when a future kind needs them.
 
 use async_trait::async_trait;
 use orchestrator_core::{
-    AttemptOutcome, ClaimedAction, DispatcherError, Sink, SinkHealthScope, SinkHealthState,
+    AttemptOutcome, ClaimedAction, DispatcherError, ExistingResult, Sink, SinkHealthScope,
+    SinkHealthState,
 };
 use std::sync::Arc;
 
+use crate::action::{ALL_KINDS, KIND_ENSURE_BRANCH};
+use crate::actions;
 use crate::auth::GithubAuth;
 use crate::health;
 
 const SINK_KEY: &str = "github";
 
 /// GitHub sink. Holds a shared `GithubAuth` for App-level operations.
-///
-/// M3: declares zero action kinds via `handles()`. M4+ extends this list as
-/// each `github.*` action is implemented.
 pub struct GithubSink {
     auth: Arc<GithubAuth>,
 }
@@ -42,7 +40,7 @@ impl GithubSink {
 #[async_trait]
 impl Sink for GithubSink {
     fn handles(&self) -> &[&'static str] {
-        &[]
+        ALL_KINDS
     }
 
     fn sink_key(&self) -> &str {
@@ -53,12 +51,29 @@ impl Sink for GithubSink {
         health::check_health(&self.auth, scope).await
     }
 
+    async fn find_existing(
+        &self,
+        action: &ClaimedAction,
+    ) -> Result<Option<ExistingResult>, DispatcherError> {
+        match action.kind.as_str() {
+            KIND_ENSURE_BRANCH => actions::ensure_branch::probe(&self.auth, action).await,
+            other => Err(DispatcherError::Internal(format!(
+                "github sink: no probe for unhandled kind '{}'",
+                other
+            ))),
+        }
+    }
+
     async fn execute(
         &self,
-        _action: &ClaimedAction,
+        action: &ClaimedAction,
     ) -> Result<AttemptOutcome, DispatcherError> {
-        Err(DispatcherError::Internal(
-            "github sink registers no action kinds; received unexpected execute call".into(),
-        ))
+        match action.kind.as_str() {
+            KIND_ENSURE_BRANCH => actions::ensure_branch::execute(&self.auth, action).await,
+            other => Err(DispatcherError::Internal(format!(
+                "github sink: no executor for unhandled kind '{}'",
+                other
+            ))),
+        }
     }
 }

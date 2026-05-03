@@ -4,18 +4,19 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
-**Milestone 3 of the GitHub sink plan: COMPLETE.**
+**Milestone 4 of the GitHub sink plan: COMPLETE.**
 
-The repo is now a Cargo workspace at `/Cargo.toml` (`members = ["crates/*"]`) with two crates:
+`github.ensure_branch` is the first real action kind. The skeleton from M3 is now wired:
 
-- `crates/orchestrator-core/` — unchanged from M2 except for the path move.
-- `crates/orchestrator-github/` — new sibling. Skeleton only:
-  - `auth.rs` — `GithubAuth` (Mutex-cached installation tokens; refreshes 60s before expiry; PEM validated at construction).
-  - `sink.rs` — `GithubSink` impl. `handles()` empty for now; `sink_key() = "github"`; `execute()` returns `DispatcherError::Internal` defensively (M4+ extends).
-  - `health.rs` — `GET /app` probe maps to `Healthy` / `Unhealthy { Auth/Permission/Config }` / `Indeterminate` per the classification table below.
-  - `extractor.rs` — `GithubHintExtractor` stub returning `None`. M4 wires the first match arm.
-  - 6 new tests (5 unit on PEM validation + JWT signing, 1 dispatcher-registration smoke test). 1 `#[ignore]`d integration test against real GitHub gated on `GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY_PEM` / `GITHUB_INSTALLATION_ID`.
-- 32 tests pass workspace-wide; `cargo clippy --all-targets -- -D warnings` clean.
+- `action.rs` — `RepoRef`, `EnsureBranchPayload`, `decode_ensure_branch` (serde + structural validation). Validation rejects malformed owners/repo names/branch names/SHAs at the dispatcher boundary so a buggy reducer becomes a fast `PermanentFail`, not a confusing GitHub 422 down the line.
+- `outcome.rs` — `BranchEnsured` event payload (`github.branch_ensured.v1`) with `already_existed: bool` to distinguish "we created it" from "we observed prior partial success".
+- `client.rs` — shared `installation_client` / `app_client` builders so M5+ doesn't grow a parallel auth path.
+- `errors.rs` — `ErrorClass` enum + pure `classify_response(status, message)` matching the classification table; `octocrab::Error` adapter wraps it.
+- `actions/ensure_branch.rs` — `execute()` does `POST /repos/{}/{}/git/refs`, with the 422-fallback flow: `read_branch_head` translates "exists at base_sha" → `Succeeded { already_existed: true }`, "exists at different SHA" → `PermanentFail` (collision). `probe()` (called by the dispatcher's `find_existing` path) shares `read_branch_head` and returns `Err` on collision per Option 1 — fast PermanentFail via execute, slower `failed_probe_exhausted` via the dispatcher path. Documented `TODO(M5/M6)` for extending the probe return type.
+- `extractor.rs` — extracts `EndpointHint::GithubRepo` from `KIND_ENSURE_BRANCH` payloads.
+- `sink.rs` — `handles()` returns `ALL_KINDS = [KIND_ENSURE_BRANCH]`; `execute`/`find_existing` dispatch on kind; unknown kinds return `DispatcherError::Internal`.
+- 70 tests pass workspace-wide (38 in github lib unit + 6 github integration + 26 in core); `cargo clippy --all-targets -- -D warnings` clean.
+- 5 `#[ignore]`d integration tests (1 health from M3, 4 ensure_branch covering happy / idempotent / probe-only / collision) gated on `GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY_PEM` / `GITHUB_INSTALLATION_ID` / `GITHUB_TEST_REPO_OWNER` / `GITHUB_TEST_REPO_NAME`.
 
 ## GitHub sink HTTP-status classification
 
@@ -68,46 +69,6 @@ Shared policy for all `github.*` action kinds (M4-M9). Per-action deviations mus
 ## What's next
 
 Implementation order, each item independently mergeable:
-
-### Milestone 4: `github.ensure_branch`
-
-First real action kind. The simplest one to implement and a good test of the pattern.
-
-**Action payload:**
-
-```rust
-pub struct EnsureBranch {
-    pub repo: RepoRef,
-    pub base_branch: String,
-    pub base_sha: String,    // required - probe checks branch.head == base_sha
-    pub branch_name: String, // pre-computed by reducer using slugify + ActionBuilder
-    pub ticket_id: String,
-}
-```
-
-**Outcome event:** `github.branch_ensured.v1`
-
-**Execute:**
-- `POST /repos/{repo}/git/refs` with `ref = refs/heads/{branch_name}` and `sha = base_sha`
-- 422 "Reference already exists" → run probe to confirm it's our branch (head matches base_sha)
-- 200/201 → success
-
-**Probe (`find_existing`):**
-- `GET /repos/{repo}/git/ref/heads/{branch_name}`
-- 404 → `Ok(None)` (branch doesn't exist; execute can proceed)
-- 200, head_sha == base_sha → `Ok(Some(...))` (already created)
-- 200, head_sha != base_sha → `Err(...)` (branch exists with different content; this is a collision and the workflow needs to escalate; treat probe as definitively failed-conflict)
-- transient errors → `Err(...)`
-
-**Tests (against a real test repo, gated behind a feature flag):**
-- Happy path: create new branch, verify it exists at `base_sha`.
-- Idempotent: run twice, verify only one branch operation observable.
-- Chaos: crash after 201 response, verify probe finds it on retry.
-- Collision: pre-create a branch with the same name pointing elsewhere; verify probe correctly errors.
-
-For the integration tests, set up a dedicated test repo (e.g. `your-org/orchestrator-test`) with a GitHub App installation. Credentials via env vars: `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY_PEM`, `GITHUB_INSTALLATION_ID`, `GITHUB_TEST_REPO_OWNER`, `GITHUB_TEST_REPO_NAME`. Skip integration tests if these aren't set.
-
-**Acceptance:** unit tests with mocked octocrab pass; integration tests pass against the real repo.
 
 ### Milestone 5: `github.commit_patch` via Git Data API
 
@@ -248,3 +209,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 1 (orchestrator-core v2 contract): complete with 7 passing tests.
 - Milestone 2 (slugify + ActionBuilder helpers): kind-coupled builder eliminates the embedded-id-vs-outbox-row drift footgun; round-trip test verifies multi-action ordering through `Storage::advance`. 26 tests pass.
 - Milestone 3 (orchestrator-github skeleton): workspace split, `GithubAuth` with PEM validation + Mutex token cache, `GithubSink` registers cleanly, `check_health` probes `GET /app` per the classification table. 32 tests pass; integration test `#[ignore]`d behind real GitHub credentials. action.rs/outcome.rs deferred to M4.
+- Milestone 4 (github.ensure_branch): first real action kind. POST /git/refs with 422-fallback probe; collision returns Err from probe (Option 1) and PermanentFail from execute. Shared error classifier + client builder for M5+. 70 tests workspace-wide; 4 #[ignore]d integration tests gated on test-repo env vars.

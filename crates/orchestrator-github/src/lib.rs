@@ -5,6 +5,7 @@
 //! global App-level `GET /app` check from M3 (per-repo probes deferred).
 
 pub mod action;
+pub mod actions;
 pub mod auth;
 pub mod client;
 pub mod errors;
