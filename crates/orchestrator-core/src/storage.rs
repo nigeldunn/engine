@@ -109,17 +109,12 @@ impl Storage {
             payload: cmd.payload.clone(),
         };
 
-        // Load prior state (or default).
-        let prior_state_json: Option<Json> = sqlx::query_scalar(
-            "SELECT state_blob FROM snapshots WHERE workflow_id = ?",
-        )
-        .bind(cmd.workflow_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(|s: String| serde_json::from_str(&s))
-        .transpose()?;
-
-        let prior_state: R::State = state_from_json(prior_state_json)?;
+        // Load prior state (or default). If the snapshot's state_version
+        // doesn't match the reducer's current state_version, the snapshot
+        // is from an older schema and would deserialize wrong (or
+        // silently misinterpret). Discard it and replay the event log to
+        // rebuild — snapshots are a cache, the event log is authoritative.
+        let prior_state: R::State = load_prior_state(&mut tx, reducer, &cmd.workflow_id).await?;
 
         // Pure reduction.
         let new_state = reducer.reduce(prior_state, &envelope)?;
@@ -1027,6 +1022,89 @@ impl Storage {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
+
+/// Load prior state for a workflow inside the advance transaction.
+///
+/// Reads `snapshots` and compares `state_version`. If the snapshot's
+/// version matches the reducer's current `state_version`, deserialize
+/// directly. Otherwise (snapshot missing OR version mismatch from a
+/// reducer schema bump) replay the event log to reconstruct state from
+/// scratch. Snapshots are a cache; the event log is authoritative.
+async fn load_prior_state<R: Reducer>(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    reducer: &R,
+    workflow_id: &WorkflowId,
+) -> Result<R::State, ExecutorError> {
+    let row = sqlx::query(
+        "SELECT state_blob, state_version FROM snapshots WHERE workflow_id = ?",
+    )
+    .bind(workflow_id.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if let Some(row) = row {
+        let blob: String = row.get("state_blob");
+        let version: i64 = row.get("state_version");
+        if version as u32 == reducer.state_version() {
+            let parsed: Json = serde_json::from_str(&blob)?;
+            return state_from_json(Some(parsed));
+        }
+        // Version mismatch — fall through to replay.
+        tracing::info!(
+            workflow_id = %workflow_id,
+            snapshot_version = version,
+            reducer_version = reducer.state_version(),
+            "snapshot state_version stale; replaying event log"
+        );
+    }
+
+    replay_state_in_tx(tx, reducer, workflow_id).await
+}
+
+/// Rebuild state by replaying every event for a workflow through the
+/// reducer in order. Used when no usable snapshot exists.
+async fn replay_state_in_tx<R: Reducer>(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    reducer: &R,
+    workflow_id: &WorkflowId,
+) -> Result<R::State, ExecutorError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, sequence, recorded_at,
+               payload_type, payload_schema_version,
+               causation_kind, causation_ref, payload
+        FROM events
+        WHERE workflow_id = ?
+        ORDER BY sequence ASC
+        "#,
+    )
+    .bind(workflow_id.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut state: R::State = state_from_json(None)?;
+    for row in rows {
+        let payload_str: String = row.get("payload");
+        let payload: Json = serde_json::from_str(&payload_str)?;
+        let causation = decode_causation(
+            row.get::<&str, _>("causation_kind"),
+            row.get::<Option<String>, _>("causation_ref"),
+        );
+        let envelope = EventEnvelope {
+            event_id: EventId(row.get::<String, _>("event_id")),
+            workflow_id: workflow_id.clone(),
+            sequence: row.get::<i64, _>("sequence") as u64,
+            recorded_at: row.get("recorded_at"),
+            payload_type: row.get("payload_type"),
+            payload_schema_version: row.get::<i64, _>("payload_schema_version") as u32,
+            causation,
+            trace_id: None,
+            payload,
+        };
+        state = reducer.reduce(state, &envelope)?;
+    }
+    Ok(state)
+}
 
 #[derive(Debug)]
 struct PriorOutcome {

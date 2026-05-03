@@ -6,6 +6,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod event;
 pub mod executor;
+pub mod failure;
 pub mod health;
 pub mod ids;
 pub mod reducer;
@@ -15,6 +16,10 @@ pub mod storage;
 
 pub use action::{Action, ActionState, AttemptOutcome, ClaimedAction};
 pub use action_builder::{ActionBuilder, ActionRef};
+pub use failure::{
+    build_failure_event_command, decode_action_failed, ActionFailedPayload,
+    EVT_ACTION_FAILED, EVT_ACTION_PROBE_EXHAUSTED, MAX_ORIGINAL_PAYLOAD_BYTES,
+};
 pub use dispatcher::{Dispatcher, DispatcherConfig};
 pub use error::{DispatcherError, ExecutorError};
 pub use event::{AdvanceOutcome, Causation, EventCommand, EventEnvelope};

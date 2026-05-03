@@ -35,6 +35,12 @@ impl Reducer for CounterReducer {
         match event.payload_type.as_str() {
             "increment.v1" => state.value += 1,
             "notified.v1" => state.notified = true,
+            // Core failure events: acknowledge as no-ops. Reducers that
+            // care about action failures pattern-match these explicitly;
+            // those that don't (like this counter test) at least have to
+            // tolerate them or `executor.advance` fails when the
+            // dispatcher writes them.
+            EVT_ACTION_FAILED | EVT_ACTION_PROBE_EXHAUSTED => {}
             other => return Err(ExecutorError::Reducer(format!("unknown event {}", other))),
         }
         Ok(state)

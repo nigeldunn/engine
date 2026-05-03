@@ -18,9 +18,10 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::action::{AttemptOutcome, ClaimedAction};
+use crate::action::{ActionState, AttemptOutcome, ClaimedAction};
 use crate::error::DispatcherError;
 use crate::executor::Executor;
+use crate::failure::build_failure_event_command;
 use crate::health::{HintExtractor, SinkHealthState};
 use crate::ids::DispatcherId;
 use crate::reducer::Reducer;
@@ -283,8 +284,26 @@ async fn handle_action<R: Reducer>(
             Err(e) => {
                 // Probe could not determine state. MUST NOT execute.
                 warn!(error = %e, "probe failed, recording probe failure");
+                let err_str = e.to_string();
+                let next_probe_count = action.probe_attempt + 1;
+                let would_exhaust = next_probe_count >= action.max_probe_attempts;
+                if would_exhaust {
+                    // Write failure event BEFORE state transition so a crash
+                    // between the two leaves us recoverable: reclaim re-runs
+                    // probe, dedup'd event-write is a no-op, state transition
+                    // completes.
+                    write_failure_event(
+                        &executor,
+                        &action,
+                        ActionState::FailedProbeExhausted,
+                        err_str.clone(),
+                        action.attempt,
+                        next_probe_count,
+                    )
+                    .await?;
+                }
                 let scheduled = storage
-                    .record_probe_failure(&action.action_id, &dispatcher_id, &e.to_string())
+                    .record_probe_failure(&action.action_id, &dispatcher_id, &err_str)
                     .await?;
                 if !scheduled {
                     error!("probe attempts exhausted; action moved to failed_probe_exhausted");
@@ -322,6 +341,22 @@ async fn handle_action<R: Reducer>(
             finalize_success(&executor, &dispatcher_id, &action, outcome_event, external_ref).await
         }
         Ok(AttemptOutcome::TransientFail { error }) => {
+            let next_attempt_count = action.attempt + 1;
+            let would_exhaust = next_attempt_count >= action.max_attempts;
+            if would_exhaust {
+                // Write failure event BEFORE the terminal state transition.
+                // Dedup-keyed advance makes the event-then-state ordering
+                // crash-safe; see failure.rs for the recovery argument.
+                write_failure_event(
+                    &executor,
+                    &action,
+                    ActionState::Failed,
+                    error.clone(),
+                    next_attempt_count,
+                    action.probe_attempt,
+                )
+                .await?;
+            }
             let scheduled = storage
                 .record_transient_failure(&action.action_id, &dispatcher_id, &error)
                 .await?;
@@ -334,6 +369,16 @@ async fn handle_action<R: Reducer>(
         }
         Ok(AttemptOutcome::PermanentFail { error }) => {
             warn!(error, "permanent failure recorded");
+            let next_attempt_count = action.attempt + 1;
+            write_failure_event(
+                &executor,
+                &action,
+                ActionState::Failed,
+                error.clone(),
+                next_attempt_count,
+                action.probe_attempt,
+            )
+            .await?;
             storage
                 .record_permanent_failure(&action.action_id, &dispatcher_id, &error)
                 .await?;
@@ -361,6 +406,19 @@ async fn handle_action<R: Reducer>(
         Err(e) => {
             warn!(error = %e, "sink errored, treating as transient");
             let err_str = e.to_string();
+            let next_attempt_count = action.attempt + 1;
+            let would_exhaust = next_attempt_count >= action.max_attempts;
+            if would_exhaust {
+                write_failure_event(
+                    &executor,
+                    &action,
+                    ActionState::Failed,
+                    err_str.clone(),
+                    next_attempt_count,
+                    action.probe_attempt,
+                )
+                .await?;
+            }
             storage
                 .record_transient_failure(&action.action_id, &dispatcher_id, &err_str)
                 .await?;
@@ -388,6 +446,29 @@ async fn finalize_success<R: Reducer>(
             Some(advance_outcome.event_id),
         )
         .await?;
+    Ok(())
+}
+
+/// Write a failure event for an action that has just (or is about to)
+/// transition to a permanent terminal state. The event is dedup-keyed so
+/// the dispatcher can safely write it before the state-transition write
+/// — see `failure.rs` for the recovery argument.
+async fn write_failure_event<R: Reducer>(
+    executor: &Executor<R>,
+    action: &ClaimedAction,
+    final_state: ActionState,
+    last_error: String,
+    attempts: u32,
+    probe_attempts: u32,
+) -> Result<(), DispatcherError> {
+    let cmd = build_failure_event_command(
+        action,
+        final_state,
+        last_error,
+        attempts,
+        probe_attempts,
+    );
+    executor.advance(cmd).await?;
     Ok(())
 }
 
