@@ -9,7 +9,10 @@ use orchestrator_core::{
 };
 use std::sync::Arc;
 
-use crate::action::{ALL_KINDS, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH, KIND_OPEN_PR};
+use crate::action::{
+    ALL_KINDS, KIND_CLOSE_PR, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH, KIND_OPEN_PR,
+    KIND_SET_PR_STATUS, KIND_UPDATE_PR_METADATA,
+};
 use crate::actions;
 use crate::auth::GithubAuth;
 use crate::health;
@@ -59,6 +62,10 @@ impl Sink for GithubSink {
             KIND_ENSURE_BRANCH => actions::ensure_branch::probe(&self.auth, action).await,
             KIND_COMMIT_PATCH => actions::commit_patch::probe(&self.auth, action).await,
             KIND_OPEN_PR => actions::open_pr::probe(&self.auth, action).await,
+            // PATCH triple: no probe, last-write-wins. Returning Ok(None)
+            // tells the dispatcher 'execute may proceed' — execute then
+            // re-applies the same intent on retry.
+            KIND_UPDATE_PR_METADATA | KIND_SET_PR_STATUS | KIND_CLOSE_PR => Ok(None),
             other => Err(DispatcherError::Internal(format!(
                 "github sink: no probe for unhandled kind '{}'",
                 other
@@ -74,6 +81,11 @@ impl Sink for GithubSink {
             KIND_ENSURE_BRANCH => actions::ensure_branch::execute(&self.auth, action).await,
             KIND_COMMIT_PATCH => actions::commit_patch::execute(&self.auth, action).await,
             KIND_OPEN_PR => actions::open_pr::execute(&self.auth, action).await,
+            KIND_UPDATE_PR_METADATA => {
+                actions::update_pr_metadata::execute(&self.auth, action).await
+            }
+            KIND_SET_PR_STATUS => actions::set_pr_status::execute(&self.auth, action).await,
+            KIND_CLOSE_PR => actions::close_pr::execute(&self.auth, action).await,
             other => Err(DispatcherError::Internal(format!(
                 "github sink: no executor for unhandled kind '{}'",
                 other

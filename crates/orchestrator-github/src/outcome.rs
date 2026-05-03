@@ -8,11 +8,17 @@
 use orchestrator_core::{ActionId, Causation, EventCommand, WorkflowId};
 use serde::{Deserialize, Serialize};
 
-use crate::action::{CommitPatchPayload, EnsureBranchPayload, OpenPrPayload, RepoRef};
+use crate::action::{
+    ClosePrPayload, CommitPatchPayload, EnsureBranchPayload, OpenPrPayload,
+    SetPrStatusPayload, UpdatePrMetadataPayload, RepoRef,
+};
 
 pub const EVT_BRANCH_ENSURED: &str = "github.branch_ensured.v1";
 pub const EVT_COMMIT_PUSHED: &str = "github.commit_pushed.v1";
 pub const EVT_PR_OPENED: &str = "github.pr_opened.v1";
+pub const EVT_PR_METADATA_UPDATED: &str = "github.pr_metadata_updated.v1";
+pub const EVT_PR_STATUS_SET: &str = "github.pr_status_set.v1";
+pub const EVT_PR_CLOSED: &str = "github.pr_closed.v1";
 
 /// Outcome event payload for a successful `github.ensure_branch`.
 ///
@@ -177,6 +183,129 @@ pub fn pr_opened_event(
         payload_type: EVT_PR_OPENED.into(),
         payload_schema_version: 1,
         payload: serde_json::to_value(&body).expect("PrOpened serializes infallibly"),
+        causation: Causation::Action {
+            action_id: action_id.clone(),
+        },
+        trace_id: None,
+        ingress_dedup_key: None,
+    }
+}
+
+/// Outcome event for `github.update_pr_metadata`. Records the *applied*
+/// title/body as observed in the PATCH response, not the requested values
+/// — matches the existing convention (`open_pr`, `commit_patch`) of
+/// recording what GitHub said happened.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrMetadataUpdated {
+    pub repo: RepoRef,
+    pub pr_number: u64,
+    pub title: String,
+    pub body: String,
+    pub action_id: ActionId,
+    pub ticket_id: String,
+}
+
+pub fn pr_metadata_updated_event(
+    workflow_id: &WorkflowId,
+    action_id: &ActionId,
+    payload: &UpdatePrMetadataPayload,
+    title: String,
+    body: String,
+) -> EventCommand {
+    let body_payload = PrMetadataUpdated {
+        repo: payload.repo.clone(),
+        pr_number: payload.pr_number,
+        title,
+        body,
+        action_id: action_id.clone(),
+        ticket_id: payload.ticket_id.clone(),
+    };
+    EventCommand {
+        workflow_id: workflow_id.clone(),
+        payload_type: EVT_PR_METADATA_UPDATED.into(),
+        payload_schema_version: 1,
+        payload: serde_json::to_value(&body_payload)
+            .expect("PrMetadataUpdated serializes infallibly"),
+        causation: Causation::Action {
+            action_id: action_id.clone(),
+        },
+        trace_id: None,
+        ingress_dedup_key: None,
+    }
+}
+
+/// Outcome event for `github.set_pr_status`. `requested_reviewers` is the
+/// canonical list as observed in the response — additive semantics mean
+/// it may include reviewers from prior calls, not just the ones this
+/// action requested.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrStatusSet {
+    pub repo: RepoRef,
+    pub pr_number: u64,
+    pub draft: bool,
+    pub requested_reviewers: Vec<String>,
+    pub action_id: ActionId,
+    pub ticket_id: String,
+}
+
+pub fn pr_status_set_event(
+    workflow_id: &WorkflowId,
+    action_id: &ActionId,
+    payload: &SetPrStatusPayload,
+    draft: bool,
+    requested_reviewers: Vec<String>,
+) -> EventCommand {
+    let body_payload = PrStatusSet {
+        repo: payload.repo.clone(),
+        pr_number: payload.pr_number,
+        draft,
+        requested_reviewers,
+        action_id: action_id.clone(),
+        ticket_id: payload.ticket_id.clone(),
+    };
+    EventCommand {
+        workflow_id: workflow_id.clone(),
+        payload_type: EVT_PR_STATUS_SET.into(),
+        payload_schema_version: 1,
+        payload: serde_json::to_value(&body_payload)
+            .expect("PrStatusSet serializes infallibly"),
+        causation: Causation::Action {
+            action_id: action_id.clone(),
+        },
+        trace_id: None,
+        ingress_dedup_key: None,
+    }
+}
+
+/// Outcome event for `github.close_pr`. Records observed `state` from the
+/// PATCH response — should be `"closed"` after a successful call.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrClosed {
+    pub repo: RepoRef,
+    pub pr_number: u64,
+    pub state: String,
+    pub action_id: ActionId,
+    pub ticket_id: String,
+}
+
+pub fn pr_closed_event(
+    workflow_id: &WorkflowId,
+    action_id: &ActionId,
+    payload: &ClosePrPayload,
+    state: String,
+) -> EventCommand {
+    let body_payload = PrClosed {
+        repo: payload.repo.clone(),
+        pr_number: payload.pr_number,
+        state,
+        action_id: action_id.clone(),
+        ticket_id: payload.ticket_id.clone(),
+    };
+    EventCommand {
+        workflow_id: workflow_id.clone(),
+        payload_type: EVT_PR_CLOSED.into(),
+        payload_schema_version: 1,
+        payload: serde_json::to_value(&body_payload).expect("PrClosed serializes infallibly"),
         causation: Causation::Action {
             action_id: action_id.clone(),
         },
@@ -394,5 +523,83 @@ mod tests {
         assert!(decoded.already_existed);
         assert_eq!(decoded.state, "closed");
         assert!(decoded.draft);
+    }
+
+    // ── PATCH-triple events ────────────────────────────────────────────
+
+    use crate::action::{ClosePrPayload, SetPrStatusPayload, UpdatePrMetadataPayload};
+
+    #[test]
+    fn pr_metadata_updated_event_records_applied_state() {
+        let wf = WorkflowId::new("wf");
+        let aid = ActionId("act_meta".into());
+        let payload = UpdatePrMetadataPayload {
+            repo: RepoRef {
+                owner: "octo".into(),
+                name: "world".into(),
+            },
+            pr_number: 7,
+            title: Some("requested title".into()),
+            body: Some("requested body".into()),
+            ticket_id: "ENG-1".into(),
+        };
+        let evt = pr_metadata_updated_event(
+            &wf,
+            &aid,
+            &payload,
+            "applied title".into(),
+            "applied body".into(),
+        );
+        assert_eq!(evt.payload_type, EVT_PR_METADATA_UPDATED);
+        let decoded: PrMetadataUpdated = serde_json::from_value(evt.payload).unwrap();
+        assert_eq!(decoded.title, "applied title");
+        assert_eq!(decoded.body, "applied body");
+        assert_eq!(decoded.pr_number, 7);
+    }
+
+    #[test]
+    fn pr_status_set_event_carries_draft_and_reviewers() {
+        let wf = WorkflowId::new("wf");
+        let aid = ActionId("act_status".into());
+        let payload = SetPrStatusPayload {
+            repo: RepoRef {
+                owner: "octo".into(),
+                name: "world".into(),
+            },
+            pr_number: 7,
+            draft: Some(false),
+            requested_reviewers: vec!["alice".into()],
+            ticket_id: "ENG-1".into(),
+        };
+        let evt = pr_status_set_event(
+            &wf,
+            &aid,
+            &payload,
+            false,
+            vec!["alice".into(), "bob".into()],
+        );
+        assert_eq!(evt.payload_type, EVT_PR_STATUS_SET);
+        let decoded: PrStatusSet = serde_json::from_value(evt.payload).unwrap();
+        assert!(!decoded.draft);
+        assert_eq!(decoded.requested_reviewers, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn pr_closed_event_records_state() {
+        let wf = WorkflowId::new("wf");
+        let aid = ActionId("act_close".into());
+        let payload = ClosePrPayload {
+            repo: RepoRef {
+                owner: "octo".into(),
+                name: "world".into(),
+            },
+            pr_number: 7,
+            ticket_id: "ENG-1".into(),
+        };
+        let evt = pr_closed_event(&wf, &aid, &payload, "closed".into());
+        assert_eq!(evt.payload_type, EVT_PR_CLOSED);
+        let decoded: PrClosed = serde_json::from_value(evt.payload).unwrap();
+        assert_eq!(decoded.state, "closed");
+        assert_eq!(decoded.pr_number, 7);
     }
 }

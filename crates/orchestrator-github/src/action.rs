@@ -18,9 +18,26 @@ pub const KIND_COMMIT_PATCH: &str = "github.commit_patch";
 /// Action kind: open a pull request.
 pub const KIND_OPEN_PR: &str = "github.open_pr";
 
+/// Action kind: PATCH a PR's title and/or body. Idempotent, last-write-wins.
+pub const KIND_UPDATE_PR_METADATA: &str = "github.update_pr_metadata";
+
+/// Action kind: change a PR's draft state and/or request reviewers.
+/// Idempotent, last-write-wins.
+pub const KIND_SET_PR_STATUS: &str = "github.set_pr_status";
+
+/// Action kind: close a PR. Idempotent (closing an already-closed PR is a no-op).
+pub const KIND_CLOSE_PR: &str = "github.close_pr";
+
 /// All action kinds the GitHub sink handles. Mirror this in `Sink::handles()`
 /// so registration stays consistent.
-pub const ALL_KINDS: &[&str] = &[KIND_ENSURE_BRANCH, KIND_COMMIT_PATCH, KIND_OPEN_PR];
+pub const ALL_KINDS: &[&str] = &[
+    KIND_ENSURE_BRANCH,
+    KIND_COMMIT_PATCH,
+    KIND_OPEN_PR,
+    KIND_UPDATE_PR_METADATA,
+    KIND_SET_PR_STATUS,
+    KIND_CLOSE_PR,
+];
 
 /// Total file-content bytes per `commit_patch` action. Bounds outbox row size
 /// (the payload sits in SQLite). 5 MiB comfortably fits ~50 files of ~100KB
@@ -249,6 +266,145 @@ pub fn decode_open_pr(
     Ok(payload)
 }
 
+// ── update_pr_metadata ──────────────────────────────────────────────────
+
+/// Title-only / body-only / both. At least one must be present.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdatePrMetadataPayload {
+    pub repo: RepoRef,
+    pub pr_number: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub ticket_id: String,
+}
+
+impl UpdatePrMetadataPayload {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        self.repo.validate()?;
+        validate_pr_number(self.pr_number)?;
+        if self.title.is_none() && self.body.is_none() {
+            return Err(DecodeError::Validation {
+                field: "title|body",
+                detail: "at least one of title or body must be present".into(),
+            });
+        }
+        if let Some(t) = &self.title {
+            require_non_empty("title", t, MAX_PR_TITLE_LEN)?;
+        }
+        if let Some(b) = &self.body {
+            if b.len() > MAX_PR_BODY_LEN {
+                return Err(DecodeError::Validation {
+                    field: "body",
+                    detail: format!(
+                        "exceeds {} chars (got {})",
+                        MAX_PR_BODY_LEN,
+                        b.len()
+                    ),
+                });
+            }
+        }
+        require_non_empty("ticket_id", &self.ticket_id, 250)?;
+        Ok(())
+    }
+}
+
+pub fn decode_update_pr_metadata(
+    raw: &serde_json::Value,
+) -> Result<UpdatePrMetadataPayload, DecodeError> {
+    let payload: UpdatePrMetadataPayload = serde_json::from_value(raw.clone())
+        .map_err(|e| DecodeError::Serde(e.to_string()))?;
+    payload.validate()?;
+    Ok(payload)
+}
+
+// ── set_pr_status ───────────────────────────────────────────────────────
+
+/// Cap on reviewers per request. GitHub allows up to 15 per call;
+/// we add a sanity bound to catch reducer bugs.
+pub const MAX_REQUESTED_REVIEWERS: usize = 15;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetPrStatusPayload {
+    pub repo: RepoRef,
+    pub pr_number: u64,
+    /// Toggle draft state. `Some(true)` → draft, `Some(false)` → ready for review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
+    /// User logins to request as reviewers. GitHub treats this as additive —
+    /// existing reviewers are preserved unless you remove them via a separate
+    /// DELETE call (out of scope for v1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_reviewers: Vec<String>,
+    pub ticket_id: String,
+}
+
+impl SetPrStatusPayload {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        self.repo.validate()?;
+        validate_pr_number(self.pr_number)?;
+        if self.draft.is_none() && self.requested_reviewers.is_empty() {
+            return Err(DecodeError::Validation {
+                field: "draft|requested_reviewers",
+                detail: "at least one of draft or requested_reviewers must be set".into(),
+            });
+        }
+        if self.requested_reviewers.len() > MAX_REQUESTED_REVIEWERS {
+            return Err(DecodeError::Validation {
+                field: "requested_reviewers",
+                detail: format!(
+                    "must not exceed {} reviewers (got {})",
+                    MAX_REQUESTED_REVIEWERS,
+                    self.requested_reviewers.len()
+                ),
+            });
+        }
+        for login in &self.requested_reviewers {
+            // GitHub user logins follow the same rules as org owners.
+            validate_owner_with_field("requested_reviewers[]", login)?;
+        }
+        require_non_empty("ticket_id", &self.ticket_id, 250)?;
+        Ok(())
+    }
+}
+
+pub fn decode_set_pr_status(
+    raw: &serde_json::Value,
+) -> Result<SetPrStatusPayload, DecodeError> {
+    let payload: SetPrStatusPayload = serde_json::from_value(raw.clone())
+        .map_err(|e| DecodeError::Serde(e.to_string()))?;
+    payload.validate()?;
+    Ok(payload)
+}
+
+// ── close_pr ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClosePrPayload {
+    pub repo: RepoRef,
+    pub pr_number: u64,
+    pub ticket_id: String,
+}
+
+impl ClosePrPayload {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        self.repo.validate()?;
+        validate_pr_number(self.pr_number)?;
+        require_non_empty("ticket_id", &self.ticket_id, 250)?;
+        Ok(())
+    }
+}
+
+pub fn decode_close_pr(
+    raw: &serde_json::Value,
+) -> Result<ClosePrPayload, DecodeError> {
+    let payload: ClosePrPayload = serde_json::from_value(raw.clone())
+        .map_err(|e| DecodeError::Serde(e.to_string()))?;
+    payload.validate()?;
+    Ok(payload)
+}
+
 // ── validators ──────────────────────────────────────────────────────────
 
 fn require_non_empty(field: &'static str, s: &str, max_len: usize) -> Result<(), DecodeError> {
@@ -269,27 +425,46 @@ fn require_non_empty(field: &'static str, s: &str, max_len: usize) -> Result<(),
 
 /// GitHub usernames / org names: 1-39 ASCII alphanumerics + single hyphens,
 /// no leading/trailing hyphen, no consecutive hyphens.
-fn validate_owner(s: &str) -> Result<(), DecodeError> {
-    require_non_empty("repo.owner", s, 39)?;
+fn validate_owner_with_field(
+    field: &'static str,
+    s: &str,
+) -> Result<(), DecodeError> {
+    require_non_empty(field, s, 39)?;
     if s.starts_with('-') || s.ends_with('-') {
         return Err(DecodeError::Validation {
-            field: "repo.owner",
+            field,
             detail: "cannot begin or end with '-'".into(),
         });
     }
     if s.contains("--") {
         return Err(DecodeError::Validation {
-            field: "repo.owner",
+            field,
             detail: "cannot contain consecutive hyphens".into(),
         });
     }
     if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(DecodeError::Validation {
-            field: "repo.owner",
+            field,
             detail: "must be ASCII alphanumeric or '-'".into(),
         });
     }
     Ok(())
+}
+
+fn validate_owner(s: &str) -> Result<(), DecodeError> {
+    validate_owner_with_field("repo.owner", s)
+}
+
+/// PR / issue numbers must be positive.
+fn validate_pr_number(n: u64) -> Result<(), DecodeError> {
+    if n == 0 {
+        Err(DecodeError::Validation {
+            field: "pr_number",
+            detail: "must be a positive integer (got 0)".into(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 /// GitHub repository names: 1-100 ASCII alphanumerics + `.`, `-`, `_`.
@@ -917,5 +1092,150 @@ mod tests {
         assert_eq!(original.title, again.title);
         assert_eq!(original.body, again.body);
         assert_eq!(original.draft, again.draft);
+    }
+
+    // ── update_pr_metadata validation ──────────────────────────────────
+
+    fn good_update_metadata() -> serde_json::Value {
+        json!({
+            "repo": { "owner": "octo", "name": "world" },
+            "pr_number": 42,
+            "title": "[orch-test] new title",
+            "ticket_id": "ENG-1",
+        })
+    }
+
+    #[test]
+    fn update_pr_metadata_decodes_with_title_only() {
+        decode_update_pr_metadata(&good_update_metadata()).unwrap();
+    }
+
+    #[test]
+    fn update_pr_metadata_decodes_with_body_only() {
+        let mut p = good_update_metadata();
+        p.as_object_mut().unwrap().remove("title");
+        p["body"] = json!("new body content");
+        decode_update_pr_metadata(&p).unwrap();
+    }
+
+    #[test]
+    fn update_pr_metadata_rejects_no_op() {
+        let mut bad = good_update_metadata();
+        bad.as_object_mut().unwrap().remove("title");
+        let err = decode_update_pr_metadata(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "title|body", .. }));
+    }
+
+    #[test]
+    fn update_pr_metadata_rejects_pr_number_zero() {
+        let mut bad = good_update_metadata();
+        bad["pr_number"] = json!(0);
+        let err = decode_update_pr_metadata(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "pr_number", .. }));
+    }
+
+    #[test]
+    fn update_pr_metadata_rejects_oversized_body() {
+        let mut bad = good_update_metadata();
+        bad["body"] = json!("x".repeat(MAX_PR_BODY_LEN + 1));
+        let err = decode_update_pr_metadata(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "body", .. }));
+    }
+
+    #[test]
+    fn update_pr_metadata_rejects_empty_title() {
+        let mut bad = good_update_metadata();
+        bad["title"] = json!("");
+        let err = decode_update_pr_metadata(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "title", .. }));
+    }
+
+    // ── set_pr_status validation ───────────────────────────────────────
+
+    fn good_set_status() -> serde_json::Value {
+        json!({
+            "repo": { "owner": "octo", "name": "world" },
+            "pr_number": 42,
+            "draft": false,
+            "ticket_id": "ENG-1",
+        })
+    }
+
+    #[test]
+    fn set_pr_status_decodes_with_draft_only() {
+        decode_set_pr_status(&good_set_status()).unwrap();
+    }
+
+    #[test]
+    fn set_pr_status_decodes_with_reviewers_only() {
+        let mut p = good_set_status();
+        p.as_object_mut().unwrap().remove("draft");
+        p["requested_reviewers"] = json!(["alice", "bob"]);
+        decode_set_pr_status(&p).unwrap();
+    }
+
+    #[test]
+    fn set_pr_status_rejects_no_op() {
+        let mut bad = good_set_status();
+        bad.as_object_mut().unwrap().remove("draft");
+        let err = decode_set_pr_status(&bad).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Validation { field: "draft|requested_reviewers", .. }
+        ));
+    }
+
+    #[test]
+    fn set_pr_status_rejects_too_many_reviewers() {
+        let mut bad = good_set_status();
+        bad["requested_reviewers"] =
+            json!((0..MAX_REQUESTED_REVIEWERS + 1).map(|i| format!("u{}", i)).collect::<Vec<_>>());
+        let err = decode_set_pr_status(&bad).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Validation { field: "requested_reviewers", .. }
+        ));
+    }
+
+    #[test]
+    fn set_pr_status_rejects_bad_reviewer_login() {
+        let mut bad = good_set_status();
+        bad["requested_reviewers"] = json!(["alice", "-leading-hyphen"]);
+        let err = decode_set_pr_status(&bad).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Validation { field: "requested_reviewers[]", .. }
+        ));
+    }
+
+    // ── close_pr validation ────────────────────────────────────────────
+
+    fn good_close_pr() -> serde_json::Value {
+        json!({
+            "repo": { "owner": "octo", "name": "world" },
+            "pr_number": 42,
+            "ticket_id": "ENG-1",
+        })
+    }
+
+    #[test]
+    fn close_pr_decodes() {
+        decode_close_pr(&good_close_pr()).unwrap();
+    }
+
+    #[test]
+    fn close_pr_rejects_pr_number_zero() {
+        let mut bad = good_close_pr();
+        bad["pr_number"] = json!(0);
+        let err = decode_close_pr(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "pr_number", .. }));
+    }
+
+    #[test]
+    fn close_pr_rejects_empty_ticket_id() {
+        let mut bad = good_close_pr();
+        bad["ticket_id"] = json!("");
+        let err = decode_close_pr(&bad).unwrap_err();
+        assert!(matches!(err, DecodeError::Validation { field: "ticket_id", .. }));
     }
 }

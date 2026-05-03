@@ -2,8 +2,8 @@
 
 use orchestrator_core::*;
 use orchestrator_github::{
-    GithubAuth, GithubHintExtractor, GithubSink, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH,
-    KIND_OPEN_PR,
+    GithubAuth, GithubHintExtractor, GithubSink, KIND_CLOSE_PR, KIND_COMMIT_PATCH,
+    KIND_ENSURE_BRANCH, KIND_OPEN_PR, KIND_SET_PR_STATUS, KIND_UPDATE_PR_METADATA,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -45,7 +45,14 @@ async fn github_sink_registers_with_dispatcher() {
     assert_eq!(sink.sink_key(), "github");
     assert_eq!(
         sink.handles(),
-        &[KIND_ENSURE_BRANCH, KIND_COMMIT_PATCH, KIND_OPEN_PR]
+        &[
+            KIND_ENSURE_BRANCH,
+            KIND_COMMIT_PATCH,
+            KIND_OPEN_PR,
+            KIND_UPDATE_PR_METADATA,
+            KIND_SET_PR_STATUS,
+            KIND_CLOSE_PR,
+        ]
     );
 
     // Register with a real Dispatcher. If the trait shape didn't match,

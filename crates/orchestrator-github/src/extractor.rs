@@ -10,8 +10,9 @@ use orchestrator_core::{EndpointHint, HintExtractor};
 use serde_json::Value;
 
 use crate::action::{
-    CommitPatchPayload, EnsureBranchPayload, OpenPrPayload, KIND_COMMIT_PATCH,
-    KIND_ENSURE_BRANCH, KIND_OPEN_PR,
+    ClosePrPayload, CommitPatchPayload, EnsureBranchPayload, OpenPrPayload, SetPrStatusPayload,
+    UpdatePrMetadataPayload, KIND_CLOSE_PR, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH, KIND_OPEN_PR,
+    KIND_SET_PR_STATUS, KIND_UPDATE_PR_METADATA,
 };
 
 pub struct GithubHintExtractor;
@@ -35,6 +36,27 @@ impl HintExtractor for GithubHintExtractor {
             }
             KIND_OPEN_PR => {
                 let p: OpenPrPayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(EndpointHint::GithubRepo {
+                    owner: p.repo.owner,
+                    name: p.repo.name,
+                })
+            }
+            KIND_UPDATE_PR_METADATA => {
+                let p: UpdatePrMetadataPayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(EndpointHint::GithubRepo {
+                    owner: p.repo.owner,
+                    name: p.repo.name,
+                })
+            }
+            KIND_SET_PR_STATUS => {
+                let p: SetPrStatusPayload = serde_json::from_value(payload.clone()).ok()?;
+                Some(EndpointHint::GithubRepo {
+                    owner: p.repo.owner,
+                    name: p.repo.name,
+                })
+            }
+            KIND_CLOSE_PR => {
+                let p: ClosePrPayload = serde_json::from_value(payload.clone()).ok()?;
                 Some(EndpointHint::GithubRepo {
                     owner: p.repo.owner,
                     name: p.repo.name,
