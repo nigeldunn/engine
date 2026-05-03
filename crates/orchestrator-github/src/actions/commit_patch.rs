@@ -202,6 +202,7 @@ pub async fn execute(
                     true, // we just updated the ref to our commit
                     new_commit_sha,
                 ),
+                side_events: vec![],
             })
         }
         Err(ErrorClass::Validation { detail }) | Err(ErrorClass::Conflict { detail })
@@ -284,6 +285,7 @@ pub async fn probe(
                 return Ok(Some(ExistingResult {
                     external_ref: Some(external_ref(&payload, &commit.sha)),
                     outcome_event: event,
+                    side_events: vec![],
                 }));
             }
         }
@@ -440,6 +442,7 @@ async fn probe_or_fail(
         Ok(Some(existing)) => AttemptOutcome::Succeeded {
             external_ref: existing.external_ref,
             outcome_event: existing.outcome_event,
+            side_events: existing.side_events,
         },
         Ok(None) => AttemptOutcome::PermanentFail { error: fail_msg },
         Err(probe_err) => AttemptOutcome::TransientFail {

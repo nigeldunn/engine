@@ -200,6 +200,7 @@ pub async fn probe(
             Ok(Some(ExistingResult {
                 external_ref: Some(external_ref(&payload, pr.number)),
                 outcome_event: event,
+                side_events: vec![],
             }))
         }
         n => Err(DispatcherError::Sink(format!(
@@ -232,6 +233,7 @@ fn succeeded(
     AttemptOutcome::Succeeded {
         external_ref: Some(external_ref(payload, pr.number)),
         outcome_event: event,
+        side_events: vec![],
     }
 }
 
@@ -244,6 +246,7 @@ async fn probe_or_fail(
         Ok(Some(existing)) => AttemptOutcome::Succeeded {
             external_ref: existing.external_ref,
             outcome_event: existing.outcome_event,
+            side_events: existing.side_events,
         },
         Ok(None) => AttemptOutcome::PermanentFail { error: fail_msg },
         Err(probe_err) => AttemptOutcome::TransientFail {

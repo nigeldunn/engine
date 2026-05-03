@@ -1144,9 +1144,9 @@ async fn insert_outbox_row(
         r#"
         INSERT INTO actions_outbox (
             action_id, workflow_id, source_sequence, action_kind, payload,
-            state, attempt, max_attempts, next_attempt_at,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+            state, attempt, max_attempts, probe_attempt, max_probe_attempts,
+            next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, 0, ?, ?, ?, ?)
         ON CONFLICT(action_id) DO NOTHING
         "#,
     )
@@ -1156,6 +1156,7 @@ async fn insert_outbox_row(
     .bind(&action.kind)
     .bind(&payload_str)
     .bind(action.max_attempts as i64)
+    .bind(action.max_probe_attempts as i64)
     .bind(next_at)
     .bind(now)
     .bind(now)

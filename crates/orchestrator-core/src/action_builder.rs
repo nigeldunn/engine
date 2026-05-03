@@ -109,6 +109,7 @@ mod tests {
             payload: json!({}),
             delay_seconds: 0,
             max_attempts: 5,
+            max_probe_attempts: 20,
         }
     }
 

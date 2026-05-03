@@ -17,9 +17,16 @@ pub struct Action {
     pub delay_seconds: u64,
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
+    /// Per-action probe attempt cap. Slow-running sinks (e.g., agent
+    /// runners blocking minutes) need a higher probe budget than the
+    /// default 20. Default 20 matches the schema default and existing
+    /// fast sinks; agent-runner reducers bump this.
+    #[serde(default = "default_max_probe_attempts")]
+    pub max_probe_attempts: u32,
 }
 
 fn default_max_attempts() -> u32 { 5 }
+fn default_max_probe_attempts() -> u32 { 20 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,12 +89,22 @@ pub struct ClaimedAction {
 
 /// Result of a dispatch attempt.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Succeeded carries an EventCommand + Vec<EventCommand>; boxing would force every sink to construct via Box::new
 pub enum AttemptOutcome {
     /// External effect confirmed. Includes optional external reference (e.g. PR URL).
     Succeeded {
         external_ref: Option<String>,
-        /// The outcome event command (caller will pass to advance).
+        /// The outcome event command (dispatcher writes via `advance`).
         outcome_event: crate::event::EventCommand,
+        /// Optional auxiliary events the sink wants written alongside the
+        /// outcome — e.g., `BudgetConsumed` for cost reporting from
+        /// agent-runner sinks. The dispatcher writes these via
+        /// `executor.advance` after the primary outcome event lands.
+        ///
+        /// Sinks must populate each side event's `ingress_dedup_key` for
+        /// crash safety; the dispatcher does not synthesize one. A
+        /// missing key means duplicate writes are possible on retry.
+        side_events: Vec<crate::event::EventCommand>,
     },
     /// Transient failure - retry with backoff.
     TransientFail { error: String },

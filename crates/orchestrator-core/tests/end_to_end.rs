@@ -57,6 +57,7 @@ impl Reducer for CounterReducer {
                 payload: json!({ "value": new_state.value }),
                 delay_seconds: 0,
                 max_attempts: 5,
+                max_probe_attempts: 20,
             }])
         } else {
             Ok(vec![])
@@ -155,6 +156,7 @@ impl Sink for CountingSink {
                 trace_id: None,
                 ingress_dedup_key: None,
             },
+            side_events: vec![],
         })
     }
 }

@@ -66,6 +66,7 @@ impl Reducer for FailureTrackerReducer {
                 payload: ev.payload.clone(),
                 delay_seconds: 0,
                 max_attempts: 1, // exhaust immediately on first failure
+                max_probe_attempts: 1,
             }])
         } else {
             Ok(vec![])
@@ -351,3 +352,167 @@ async fn failure_event_advance_is_idempotent_via_dedup_key() {
         "should be exactly one failure event despite two advance calls"
     );
 }
+
+// ── side events ──────────────────────────────────────────────────────
+
+/// Reducer that emits a single action and tracks side-event observation.
+#[derive(Default, Clone, Serialize, Deserialize, Debug)]
+struct SideEventState {
+    pub primary_observed: u32,
+    pub side_observed: u32,
+    pub side_dedup_keys_seen: Vec<String>,
+}
+
+struct SideEventReducer;
+
+impl Reducer for SideEventReducer {
+    type State = SideEventState;
+    fn state_version(&self) -> u32 {
+        1
+    }
+    fn reduce(
+        &self,
+        mut state: Self::State,
+        ev: &EventEnvelope,
+    ) -> Result<Self::State, ExecutorError> {
+        match ev.payload_type.as_str() {
+            "trigger.v1" => {}
+            "primary.v1" => state.primary_observed += 1,
+            "side.v1" => {
+                state.side_observed += 1;
+            }
+            _ => {}
+        }
+        Ok(state)
+    }
+    fn derive_actions(
+        &self,
+        _state: &Self::State,
+        ev: &EventEnvelope,
+    ) -> Result<Vec<Action>, ExecutorError> {
+        if ev.payload_type == "trigger.v1" {
+            Ok(vec![Action {
+                kind: "test.side_event_action".into(),
+                payload: serde_json::json!({}),
+                delay_seconds: 0,
+                max_attempts: 1,
+                max_probe_attempts: 20,
+            }])
+        } else {
+            Ok(vec![])
+        }
+    }
+}
+
+struct SideEventSink;
+
+#[async_trait]
+impl Sink for SideEventSink {
+    fn handles(&self) -> &[&'static str] {
+        &["test.side_event_action"]
+    }
+    fn sink_key(&self) -> &str {
+        "test-side-events"
+    }
+    async fn execute(
+        &self,
+        action: &ClaimedAction,
+    ) -> Result<AttemptOutcome, DispatcherError> {
+        let primary = EventCommand {
+            workflow_id: action.workflow_id.clone(),
+            payload_type: "primary.v1".into(),
+            payload_schema_version: 1,
+            payload: serde_json::json!({}),
+            causation: Causation::Action {
+                action_id: action.action_id.clone(),
+            },
+            trace_id: None,
+            ingress_dedup_key: None,
+        };
+        let side = EventCommand {
+            workflow_id: action.workflow_id.clone(),
+            payload_type: "side.v1".into(),
+            payload_schema_version: 1,
+            payload: serde_json::json!({"note": "side event"}),
+            causation: Causation::Action {
+                action_id: action.action_id.clone(),
+            },
+            trace_id: None,
+            ingress_dedup_key: Some(format!("side:{}", action.action_id.as_str())),
+        };
+        Ok(AttemptOutcome::Succeeded {
+            external_ref: None,
+            outcome_event: primary,
+            side_events: vec![side],
+        })
+    }
+}
+
+#[tokio::test]
+async fn side_events_are_written_after_primary_outcome() {
+    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let executor = Arc::new(Executor::new(storage, SideEventReducer));
+    let mut dispatcher = Dispatcher::new(
+        executor.clone(),
+        DispatcherConfig {
+            poll_interval: Duration::from_millis(50),
+            ..Default::default()
+        },
+    );
+    dispatcher.register(SideEventSink);
+    let shutdown = dispatcher.shutdown_handle();
+    tokio::spawn(dispatcher.run());
+
+    let workflow_id = WorkflowId::new("wf-side");
+    executor
+        .advance(EventCommand {
+            workflow_id: workflow_id.clone(),
+            payload_type: "trigger.v1".into(),
+            payload_schema_version: 1,
+            payload: serde_json::json!({}),
+            causation: Causation::External {
+                source: "t".into(),
+                request_id: "r".into(),
+            },
+            trace_id: None,
+            ingress_dedup_key: Some("trigger".into()),
+        })
+        .await
+        .unwrap();
+
+    // Wait for both primary and side events to land.
+    let mut both_observed = false;
+    for _ in 0..30 {
+        let events = executor.storage().read_events(&workflow_id).await.unwrap();
+        let has_primary = events.iter().any(|e| e.payload_type == "primary.v1");
+        let has_side = events.iter().any(|e| e.payload_type == "side.v1");
+        if has_primary && has_side {
+            both_observed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(both_observed, "expected both primary and side events to land");
+
+    // Verify ordering: primary comes BEFORE side in sequence.
+    let events = executor.storage().read_events(&workflow_id).await.unwrap();
+    let primary_seq = events
+        .iter()
+        .find(|e| e.payload_type == "primary.v1")
+        .unwrap()
+        .sequence;
+    let side_seq = events
+        .iter()
+        .find(|e| e.payload_type == "side.v1")
+        .unwrap()
+        .sequence;
+    assert!(
+        primary_seq < side_seq,
+        "primary {} should come before side {}",
+        primary_seq,
+        side_seq
+    );
+
+    shutdown.notify_one();
+}
+

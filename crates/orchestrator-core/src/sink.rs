@@ -63,4 +63,9 @@ pub trait Sink: Send + Sync + 'static {
 pub struct ExistingResult {
     pub external_ref: Option<String>,
     pub outcome_event: crate::event::EventCommand,
+    /// Optional auxiliary events the sink wants written alongside the
+    /// recovered outcome — e.g., `BudgetConsumed` for cost reporting on
+    /// crash-recovery paths. Same shape and dedup-key contract as
+    /// `AttemptOutcome::Succeeded.side_events`.
+    pub side_events: Vec<crate::event::EventCommand>,
 }

@@ -120,6 +120,7 @@ pub async fn probe(
             Ok(Some(ExistingResult {
                 external_ref: Some(external_ref(&payload)),
                 outcome_event: event,
+                side_events: vec![],
             }))
         }
         Some(other_sha) => {
@@ -270,6 +271,7 @@ fn succeeded(
     AttemptOutcome::Succeeded {
         external_ref: Some(external_ref(payload)),
         outcome_event: event,
+        side_events: vec![],
     }
 }
 

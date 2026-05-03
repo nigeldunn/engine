@@ -275,6 +275,7 @@ async fn handle_action<R: Reducer>(
                     &action,
                     existing.outcome_event,
                     existing.external_ref,
+                    existing.side_events,
                 )
                 .await;
             }
@@ -337,8 +338,17 @@ async fn handle_action<R: Reducer>(
         Ok(AttemptOutcome::Succeeded {
             external_ref,
             outcome_event,
+            side_events,
         }) => {
-            finalize_success(&executor, &dispatcher_id, &action, outcome_event, external_ref).await
+            finalize_success(
+                &executor,
+                &dispatcher_id,
+                &action,
+                outcome_event,
+                external_ref,
+                side_events,
+            )
+            .await
         }
         Ok(AttemptOutcome::TransientFail { error }) => {
             let next_attempt_count = action.attempt + 1;
@@ -433,9 +443,19 @@ async fn finalize_success<R: Reducer>(
     action: &ClaimedAction,
     outcome_event: crate::event::EventCommand,
     external_ref: Option<String>,
+    side_events: Vec<crate::event::EventCommand>,
 ) -> Result<(), DispatcherError> {
     // Write outcome event first - the durable record that the side effect happened.
     let advance_outcome = executor.advance(outcome_event).await?;
+    // Then write any sink-supplied side events. Each side event carries its
+    // own ingress_dedup_key (M12 contract) so retries from a partial-write
+    // crash absorb duplicates. If a side-event write fails here, finalize
+    // returns Err; the dispatcher logs and the action's lease eventually
+    // expires. On reclaim, the outcome event's dedup absorbs the repeat,
+    // and side events are re-attempted.
+    for side in side_events {
+        executor.advance(side).await?;
+    }
     // Mark the outbox row succeeded.
     executor
         .storage()

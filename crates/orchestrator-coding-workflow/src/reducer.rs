@@ -30,6 +30,9 @@ use crate::state::{
 
 const MAX_BRANCH_SLUG_LEN: usize = 60;
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+/// Matches the schema default and existing fast-sink behavior. M12b's
+/// reducer updates bumps this per agent kind for slow-running sinks.
+const DEFAULT_MAX_PROBE_ATTEMPTS: u32 = 20;
 
 // We're also subscribed to github outcome events emitted by the github sink.
 const EVT_GH_BRANCH_ENSURED: &str = orchestrator_github::EVT_BRANCH_ENSURED;
@@ -473,6 +476,7 @@ fn build_triage_action(event: &EventEnvelope, state: &WorkflowState) -> Action {
         payload,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     }
     .with_event_for_id_check(event)
 }
@@ -487,6 +491,7 @@ fn build_planner_action(event: &EventEnvelope, state: &WorkflowState) -> Action 
         payload,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     }
     .with_event_for_id_check(event)
 }
@@ -534,6 +539,7 @@ fn build_ensure_branch_action(
         payload: serde_json::to_value(&payload).map_err(decode_err)?,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     })
 }
 
@@ -551,6 +557,7 @@ fn build_coder_action(_event: &EventEnvelope, state: &WorkflowState) -> Action {
         payload,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     }
 }
 
@@ -605,6 +612,7 @@ fn build_commit_patch_action(
         payload: serde_json::to_value(&payload).map_err(decode_err)?,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     })
 }
 
@@ -620,6 +628,7 @@ fn build_reviewer_action(_event: &EventEnvelope, state: &WorkflowState) -> Actio
         payload,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     }
 }
 
@@ -635,6 +644,7 @@ fn build_security_reviewer_action(_event: &EventEnvelope, state: &WorkflowState)
         payload,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     }
 }
 
@@ -680,6 +690,7 @@ fn build_open_pr_action(
         payload: serde_json::to_value(&payload).map_err(decode_err)?,
         delay_seconds: 0,
         max_attempts: DEFAULT_MAX_ATTEMPTS,
+        max_probe_attempts: DEFAULT_MAX_PROBE_ATTEMPTS,
     })
 }
 

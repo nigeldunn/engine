@@ -70,6 +70,7 @@ pub async fn execute(
                     payload.pr_number
                 )),
                 outcome_event: event,
+                side_events: vec![],
             })
         }
         Err(e) => Ok(map_class_to_outcome(classify_github_error(&e), &payload)),

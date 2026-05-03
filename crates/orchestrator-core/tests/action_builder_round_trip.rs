@@ -39,18 +39,21 @@ impl Reducer for MultiActionReducer {
             payload: json!({}),
             delay_seconds: 0,
             max_attempts: 1,
+            max_probe_attempts: 20,
         });
         b.push(Action {
             kind: "kind.bravo".into(),
             payload: json!({}),
             delay_seconds: 0,
             max_attempts: 1,
+            max_probe_attempts: 20,
         });
         b.push(Action {
             kind: "kind.charlie".into(),
             payload: json!({}),
             delay_seconds: 0,
             max_attempts: 1,
+            max_probe_attempts: 20,
         });
         Ok(b.into_actions())
     }
@@ -85,18 +88,21 @@ async fn action_builder_ids_match_storage_advance_indices() {
         payload: json!({}),
         delay_seconds: 0,
         max_attempts: 1,
+        max_probe_attempts: 20,
     });
     let r1 = b.push(Action {
         kind: "kind.bravo".into(),
         payload: json!({}),
         delay_seconds: 0,
         max_attempts: 1,
+        max_probe_attempts: 20,
     });
     let r2 = b.push(Action {
         kind: "kind.charlie".into(),
         payload: json!({}),
         delay_seconds: 0,
         max_attempts: 1,
+        max_probe_attempts: 20,
     });
 
     assert_eq!(outcome.actions_enqueued.len(), 3);
@@ -150,6 +156,7 @@ async fn changing_only_kind_changes_the_persisted_id() {
                 payload: json!({}),
                 delay_seconds: 0,
                 max_attempts: 1,
+                max_probe_attempts: 20,
             });
             Ok(b.into_actions())
         }

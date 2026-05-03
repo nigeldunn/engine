@@ -130,6 +130,7 @@ pub async fn execute(
             payload.pr_number
         )),
         outcome_event: event,
+        side_events: vec![],
     })
 }
 

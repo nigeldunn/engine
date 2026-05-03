@@ -93,6 +93,7 @@ pub async fn execute(
             Ok(AttemptOutcome::Succeeded {
                 external_ref: Some(c.id.to_string()),
                 outcome_event: event,
+                side_events: vec![],
             })
         }
         Err(e) => Ok(map_class_to_outcome(classify_github_error(&e), &payload)),
@@ -172,6 +173,7 @@ pub async fn probe(
             Ok(Some(ExistingResult {
                 external_ref: Some(c.id.to_string()),
                 outcome_event: event,
+                side_events: vec![],
             }))
         }
         n => Err(DispatcherError::Sink(format!(

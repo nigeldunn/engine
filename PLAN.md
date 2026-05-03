@@ -4,6 +4,19 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
+**Milestone 12a of the GitHub sink plan: COMPLETE.**
+
+Core extensions to support agent-runner sinks (M12c). Two small additions:
+
+- `AttemptOutcome::Succeeded` and `ExistingResult` gain `side_events: Vec<EventCommand>`. Sinks that want auxiliary events (e.g., `BudgetConsumed` for cost reporting) populate the field; the dispatcher's `finalize_success` writes the outcome event first, then iterates `side_events` and writes each via `executor.advance` (using the side event's own `ingress_dedup_key` for crash safety).
+- `Action` gains `max_probe_attempts: u32` (default 20 via serde, matching the schema default and existing fast-sink behavior). Slow-running sinks (agent runners blocking minutes) need a higher probe budget than the default.
+
+The dispatcher reads `action.max_probe_attempts` via `Storage::insert_outbox_row` instead of relying on the SQL default.
+
+All existing sinks updated to construct `Succeeded { ..., side_events: vec![] }` and Action constructions with the new field. Workspace-wide changes: 13 outcome construction sites + 11 Action construction sites updated.
+
+1 new test added (`side_events_are_written_after_primary_outcome`) verifying that the dispatcher writes side events after the primary outcome event in sequence order. 231 tests pass workspace-wide (was 230 after M11b; +1).
+
 **Milestone 11b of the GitHub sink plan: COMPLETE.**
 
 The coding workflow reducer is alive. New crate `orchestrator-coding-workflow` implements the linear single-task happy path: ingest → triage → plan → ensure_branch → code → commit → review → security review → open PR → await human approval → merged. Halt-on-failure (matched against `pending_action_ids`); budget tracking with fixed-point cents; webhook translation for `pull_request.merged`.
