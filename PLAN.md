@@ -4,6 +4,26 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
+**Milestone 11b of the GitHub sink plan: COMPLETE.**
+
+The coding workflow reducer is alive. New crate `orchestrator-coding-workflow` implements the linear single-task happy path: ingest → triage → plan → ensure_branch → code → commit → review → security review → open PR → await human approval → merged. Halt-on-failure (matched against `pending_action_ids`); budget tracking with fixed-point cents; webhook translation for `pull_request.merged`.
+
+- `events.rs` — domain event types: `TicketIngested`, `TriageCompleted`, `PlanProposed`, `CoderOutput`, `ReviewerOutput`, `SecurityReviewerOutput`, `BudgetConsumed`, `PrMerged`. `Severity` is a typed enum (Codex round-2: free-form strings let unknown values flow into pure reducer logic; typed enum fails fast on schema drift).
+- `state.rs` — wide-flat `WorkflowState` with `WorkflowStatus` tag-only enum. `pending_action_ids: HashMap<ActionId, ExpectedOutcomeKind>` lets failure events be matched by `action_id` (Codex round-2: matching by kind alone misattributes failures across multiple instances over a workflow lifetime).
+- `reducer.rs` — pure-function `reduce` + `derive_actions`. Each event produces 0-1 actions in v1. Action ids computed via `ActionId::derive` with idx=0; this matches what `Storage::advance` derives from the returned `Vec<Action>`. Halt-on-rejection paths for triage / reviewer / security findings (high+critical severities are blockers). Budget guard: cumulative cents (u64 — fixed-point for deterministic replay per Codex round-2) checked against optional cap.
+- `webhook.rs` — `translate_github_webhook` filters to `pull_request.closed` with `merged: true`, producing a `PrMerged` event. Workflow id resolution is the consumer's closure (per M10's transport-only contract).
+- 16 new tests (5 webhook + 11 reducer happy-path + halt-path coverage). `cargo clippy --all-targets -- -D warnings` clean.
+
+**Deferred to M11c+** (deliberate scope cut from Codex round-1):
+- Multi-task plans (currently halts when `tasks.len() != 1`).
+- Review iteration loops (rejected → re-code with feedback).
+- Architecture review step.
+- Triage `Indeterminate` paths.
+- Failure compensation beyond halt.
+- Cost-from-agents wiring (M12 territory).
+
+230 tests pass workspace-wide (was 214 after M11a; +16). cargo build / clippy --all-targets -- -D warnings clean.
+
 **Milestone 11a of the GitHub sink plan: COMPLETE.**
 
 Failure events + state-version migration. Two small core changes that together unblock M11b (the workflow reducer): the reducer can now observe permanent action failures, and reducers can evolve their state schema without breaking in-flight workflows.
@@ -88,21 +108,16 @@ Deferred from v1:
 - `github.update_pr_branch` (atomic multi-commit — reducer emits separate `commit_patch` actions instead)
 - `github.merge_pr` (humans merge; orchestrator observes via webhook)
 
-### Milestone 11: The actual coding workflow reducer
+### Milestone 11c+: Workflow reducer extensions (deferred from M11b)
 
-Replace the counter test reducer with the real ticket workflow. Domain events for:
-- Ticket ingested (from Jira/Linear/etc.)
-- Triage complete
-- Plan proposed (planner agent output)
-- Architecture proposed (architect agent output)
-- Task started/completed (per task in the plan DAG)
-- Review requested/passed/rejected
-- Security review requested/passed/rejected
-- PR opened
-- Awaiting human approval
-- Merged or closed
+Each item is independently mergeable. M11b's linear single-task design accommodates these as additive changes.
 
-This is a much bigger piece of work and likely warrants its own design document before implementation. The reducer alone might be 500-1000 lines.
+- **Multi-task plans.** Lift `tasks.len() != 1` halt; cycle through tasks with explicit task_idx routing. Reducer adds a `Coding { task_idx }`-style state distinguishing tasks. Adds the per-task DAG.
+- **Review iteration loops.** On `ReviewerOutput { passed: false, feedback }`, instead of halting, transition back to `Coding` with the feedback in state. Track iteration count; cap to prevent infinite loops.
+- **Architecture review step.** Optional intermediate state between Planning and EnsuringBranch where an architecture agent runs.
+- **Triage `Indeterminate` paths.** Currently triage is binary accept/reject; add a third "needs_more_info" path that emits a human-escalation action.
+- **Failure compensation beyond halt.** On certain failure types (e.g., reviewer agent unreachable), retry a fresh agent run rather than halting outright.
+- **Cost-from-agents wiring.** M12 agent sinks emit `BudgetConsumed` events; this is the M12 contract, not M11c.
 
 ### Milestone 12: Agent runner sinks
 
@@ -162,3 +177,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 8 (github.post_issue_comment): seventh and final v1 action. Dual-marker idempotency — HTML primary `<!-- orchestrator-action: {id} -->`, plain-text sha256 footer `[orch:{8 hex}]` as stripped-HTML-tolerant fallback. Probe scans `GET /issues/{n}/comments` paginated up to MAX_COMMENT_PROBE_PAGES=3 and matches either marker form; multi-match → Err per collision safety bar. comment_id flows to external_ref via finalize_succeeded but probe uses scan (Path-B direct lookup deferred). 171 tests workspace-wide; 5 #[ignore]d integration tests covering happy with both markers, idempotent via probe scan, probe-only via HTML marker, probe-only via sha256 fallback, and multi-match Err. **v1 GitHub action surface complete (all 7 kinds wired).**
 - Milestone 10 (orchestrator-github-webhook crate): HMAC-validated webhook ingestion. New library crate provides `router(config, handler) -> axum::Router` with HMAC-SHA256 over raw body bytes (Bytes extractor, never Json), constant-time compare via subtle, GithubWebhookDelivery handed to consumer's translation closure. HTTP status codes: 400 missing-header / malformed-signature, 403 signature-mismatch, 422 JSON-parse, 500 handler-error (413 from axum's DefaultBodyLimit). Workflow routing is the consumer's concern. 200 tests workspace-wide; 29 new (17 unit + 12 integration via tower::ServiceExt::oneshot, no real network bind). Closes the loop: orchestrator opens PR → human merges → webhook → workflow advances.
 - Milestone 11a (failure events + state-version migration): two small core changes that unblock the workflow reducer. New EVT_ACTION_FAILED / EVT_ACTION_PROBE_EXHAUSTED events written via executor.advance with distinct dedup-key prefixes; event-then-state ordering with dedup makes crash-recovery safe. Storage::advance discards stale snapshots and replays from event log when state_version mismatches. 214 tests workspace-wide; +14 new (failure unit + E2E + migration tests).
+- Milestone 11b (orchestrator-coding-workflow crate): linear single-task happy path with halt-on-failure + budget tracking + webhook translation. Severity is a typed enum; budget cents as u64 (deterministic replay); failure events matched by action_id (not kind). Wide-flat WorkflowState evolves via state_version. Pure-function reducer tests cover happy path + each halt path + budget guard + action_failed routing. 230 tests workspace-wide; +16 new (5 webhook + 11 reducer). Multi-task plans, review iteration, architecture step, and failure compensation deferred to M11c+.

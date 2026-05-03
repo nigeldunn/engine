@@ -1392,6 +1392,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "orchestrator-coding-workflow"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "orchestrator-core",
+ "orchestrator-github",
+ "orchestrator-github-webhook",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "orchestrator-core"
 version = "0.1.0"
 dependencies = [
