@@ -37,8 +37,8 @@ async fn github_sink_registers_with_dispatcher() {
     let auth = GithubAuth::new(12345, pem, 67890).expect("fixture must parse");
     let sink = GithubSink::new(auth);
 
-    // Sanity: trait surface. M4+ registers the action kinds the sink
-    // currently implements; right now that's just `github.ensure_branch`.
+    // Sanity: trait surface. handles() is ALL_KINDS — extends as more
+    // action kinds land.
     assert_eq!(sink.sink_key(), "github");
     assert_eq!(sink.handles(), &[KIND_ENSURE_BRANCH]);
 
