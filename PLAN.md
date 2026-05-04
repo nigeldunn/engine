@@ -186,9 +186,44 @@ Shared policy for all `github.*` action kinds (M4-M9). Per-action deviations mus
 
 ## What's next
 
-Implementation order, each item independently mergeable:
+The five workspace crates are libraries. There is no binary that wires them together, no configuration story, no entry point for ingesting tickets. That's M13. Everything below M13 is post-v1 polish and can be picked up opportunistically.
 
-Deferred from v1:
+### Milestone 13: app binary + end-to-end runtime
+
+Goal: a single binary that boots the whole workspace and runs a real ticket through to a real merged PR. The architecture is done; what's missing is the operational shake-out — cold starts, real network flakes, schema migration on a long-running workflow, dashboards.
+
+**Scope of the binary** (new crate, e.g. `crates/orchestrator-app`):
+
+- Read configuration (TOML or env) for SQLite path, GitHub App credentials (app_id, install_id, private_key_path, webhook_secret, sink_key), agent service base URL + optional bearer token, listen addresses for the webhook + ticket-ingest endpoints.
+- Open `Storage`, build `Executor::new(storage, WorkflowReducer)`, build `Dispatcher` with reasonable production config (longer poll/health intervals than tests).
+- Register both sinks: `GithubSink` (with its `HintExtractor`) and `AgentRunnerSink<HttpAgentClient>`.
+- Spawn the dispatcher loop and a graceful-shutdown handler that uses the `Notify`-based shutdown handle (don't try to `abort()` it).
+- Mount the `orchestrator-github-webhook::router(...)` HTTP server. The handler closure translates `pull_request.closed{merged: true}` deliveries into `PrMerged` events via `executor.advance(...)`. **Workflow-id resolution is the critical wiring decision** — see open questions.
+- Expose a small ticket-ingest endpoint: POST a `TicketIngested` payload, the handler builds an `EventCommand` (with a fresh `WorkflowId` and an `ingress_dedup_key` derived from the ticket id) and calls `executor.advance(...)`. Either an HTTP endpoint or a CLI subcommand is fine; HTTP is more flexible for production.
+
+**External services the operator must provide**:
+
+- A **GitHub App** with `pull_request` webhook subscription and contents/PRs/issues write. App ID, Installation ID, PEM private key, webhook secret.
+- A **publicly reachable URL** for the webhook endpoint. Local dev: ngrok or cloudflared tunnel. Production: deploy somewhere with a public IP and TLS.
+- An **agent service** that implements the M12 HTTP contract (`POST /run/{type}`, `GET /status/{type}/{id}`, `GET /healthz`) and produces output JSON matching the schemas in `orchestrator-coding-workflow/src/events.rs`. **This is the brain of the system** and the largest piece outside this repo's scope.
+
+**Recommended bring-up path**:
+
+1. Land the binary with both sinks pluggable but configurable to no-op stubs.
+2. Stub agent service: a minimal HTTP server returning canned responses (accept triage, single-task plan, hardcoded patch, pass review, pass security review). Lets us watch the engine drive the state machine without an LLM in the loop.
+3. Real GitHub App against a throwaway test repo. Run a ticket end-to-end with the stub agent. Confirm crash recovery by killing the binary mid-workflow and restarting.
+4. Swap the stub agent for a real LLM-backed implementation.
+
+**Open questions for M13** (resolve during design, not now):
+
+- *Workflow-id from webhooks.* The webhook crate is transport-only. The translation closure needs to map `(repo, pr_number)` → `WorkflowId`. Options: (a) `WorkflowId::new(format!("ticket:{}", ticket_id))` with a sidecar `pr_locator` table that maps `(repo, pr_number)` → `WorkflowId`, populated when `apply_pr_opened` fires; (b) embed the workflow id in the PR body marker so it can be parsed back; (c) store the mapping on the github sink's outcome events. (a) is the most explicit; the sidecar table is small.
+- *Ticket-ingest API shape.* `POST /tickets` taking a `TicketIngested` JSON body is the simplest. Authentication on this endpoint is out of scope for v1 — assume internal network or a reverse proxy enforces auth.
+- *Configuration loading.* TOML via `serde` + `figment` (or similar) covers all config types cleanly. Avoid env-only because the GitHub PEM doesn't fit in env vars comfortably.
+- *Logging shape.* `tracing-subscriber` with `RUST_LOG`-controlled filters and JSON output for production. The crates already use `#[instrument]` extensively; we just need the subscriber wiring.
+
+This milestone is mostly plumbing — half a day of focused work for the binary itself. The real cost is providing the agent service and the GitHub App; those are operator concerns, not engineering ones.
+
+### Deferred github.* action kinds (post-v1)
 - `github.post_review_comment` (inline comments — diff position validity adds complexity)
 - `github.update_pr_branch` (atomic multi-commit — reducer emits separate `commit_patch` actions instead)
 - `github.merge_pr` (humans merge; orchestrator observes via webhook)
