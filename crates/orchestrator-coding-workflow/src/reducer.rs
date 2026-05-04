@@ -55,6 +55,20 @@ const AGENT_MAX_PROBE_ATTEMPTS: u32 = 40;
 /// against runaway agent costs from a perpetually-rejecting reviewer.
 const MAX_REVIEW_ITERATIONS: u32 = 5;
 
+/// M11f: cap on the per-action-chain compensation depth for agent.*
+/// failures. `1` means each fresh agent action gets at most one
+/// retry-from-scratch after exhausting its (already generous) attempt
+/// budget — single-shot safety net for transient infrastructure
+/// failures, not a prolonged second attempt at a genuinely failing
+/// plan. The combined effective budget is therefore 2×
+/// max_attempts × backoff_cap (~hours per agent action).
+///
+/// github.* failures do NOT compensate; they halt the workflow
+/// immediately, on the assumption that github 4xx/5xx exhaustion
+/// reflects either misconfiguration or a sustained outage that a
+/// blind retry won't fix.
+const MAX_COMPENSATION_DEPTH: u32 = 1;
+
 // We're also subscribed to github outcome events emitted by the github sink.
 const EVT_GH_BRANCH_ENSURED: &str = orchestrator_github::EVT_BRANCH_ENSURED;
 const EVT_GH_COMMIT_PUSHED: &str = orchestrator_github::EVT_COMMIT_PUSHED;
@@ -167,6 +181,37 @@ impl Reducer for WorkflowReducer {
             EVT_SECURITY_REVIEWER_OUTPUT if new_state.status == WorkflowStatus::OpeningPr => {
                 vec![build_open_pr_action(triggering_event, new_state)?]
             }
+            // M11f: failure compensation. apply_action_failed preserves
+            // an agent-waiting status when it pre-registered a fresh
+            // pending action; halt sets status = Failed (which
+            // is_terminal short-circuits above). So reaching this arm
+            // with one of the agent-waiting statuses below implies a
+            // compensation was activated — re-emit the matching agent
+            // action. The arm dispatches by status alone (Codex
+            // round-2 G) because each agent-waiting status maps 1:1 to
+            // exactly one agent kind in this reducer; decoding `kind`
+            // from the failure payload would be redundant.
+            EVT_ACTION_FAILED | EVT_ACTION_PROBE_EXHAUSTED => match new_state.status {
+                WorkflowStatus::Triaging => {
+                    vec![build_triage_action(triggering_event, new_state)]
+                }
+                WorkflowStatus::Planning => {
+                    vec![build_planner_action(triggering_event, new_state)]
+                }
+                WorkflowStatus::Architecting => {
+                    vec![build_architect_action(triggering_event, new_state)]
+                }
+                WorkflowStatus::Coding => {
+                    vec![build_coder_action(triggering_event, new_state)]
+                }
+                WorkflowStatus::Reviewing => {
+                    vec![build_reviewer_action(triggering_event, new_state)]
+                }
+                WorkflowStatus::SecurityReviewing => {
+                    vec![build_security_reviewer_action(triggering_event, new_state)]
+                }
+                _ => vec![],
+            },
             // AwaitingHumanApproval and Merged: no actions; we wait for
             // the webhook.
             _ => vec![],
@@ -212,7 +257,7 @@ fn apply_triage_completed(
         return Ok(());
     }
     let p: TriageCompleted = decode(&event.payload).map_err(decode_err)?;
-    state.pending_action_ids.remove(&p.action_id);
+    complete_pending(state, &p.action_id);
 
     if !p.accepted {
         halt(
@@ -239,7 +284,7 @@ fn apply_plan_proposed(
         return Ok(());
     }
     let p: PlanProposed = decode(&event.payload).map_err(decode_err)?;
-    state.pending_action_ids.remove(&p.action_id);
+    complete_pending(state, &p.action_id);
 
     if p.tasks.is_empty() {
         halt(
@@ -282,7 +327,7 @@ fn apply_architecture_proposed(
         return Ok(());
     }
     let p: ArchitectureProposed = decode(&event.payload).map_err(decode_err)?;
-    state.pending_action_ids.remove(&p.action_id);
+    complete_pending(state, &p.action_id);
 
     if !p.accepted {
         // v1: halt on rejection. M11f could iterate (similar to M11d).
@@ -326,7 +371,7 @@ fn apply_branch_ensured(
     state.branch_name = branch_name;
     state.head_sha = head_sha;
     if let Some(aid) = &action_id {
-        state.pending_action_ids.remove(aid);
+        complete_pending(state, aid);
     }
 
     state.status = WorkflowStatus::Coding;
@@ -345,7 +390,7 @@ fn apply_coder_output(
         return Ok(());
     }
     let p: CoderOutput = decode(&event.payload).map_err(decode_err)?;
-    state.pending_action_ids.remove(&p.action_id);
+    complete_pending(state, &p.action_id);
 
     let expected_idx = state.current_task.unwrap_or(0);
     if p.task_idx != expected_idx {
@@ -384,7 +429,7 @@ fn apply_commit_pushed(
         state.head_sha = Some(s);
     }
     if let Some(aid) = &action_id {
-        state.pending_action_ids.remove(aid);
+        complete_pending(state, aid);
     }
 
     // Branch on whether more tasks remain. Defensive bounds guard
@@ -434,7 +479,7 @@ fn apply_reviewer_output(
         return Ok(());
     }
     let p: ReviewerOutput = decode(&event.payload).map_err(decode_err)?;
-    state.pending_action_ids.remove(&p.action_id);
+    complete_pending(state, &p.action_id);
 
     if !p.passed {
         // Iterate: re-run the coder with the reviewer's feedback. Capped
@@ -492,7 +537,7 @@ fn apply_security_reviewer_output(
         return Ok(());
     }
     let p: SecurityReviewerOutput = decode(&event.payload).map_err(decode_err)?;
-    state.pending_action_ids.remove(&p.action_id);
+    complete_pending(state, &p.action_id);
 
     let has_blocker = p.findings.iter().any(|f| {
         matches!(f.severity, Severity::High | Severity::Critical)
@@ -530,7 +575,7 @@ fn apply_pr_opened(
     state.pr_number = pr_number;
     state.pr_html_url = html_url;
     if let Some(aid) = &action_id {
-        state.pending_action_ids.remove(aid);
+        complete_pending(state, aid);
     }
     state.status = WorkflowStatus::AwaitingHumanApproval;
     Ok(())
@@ -572,14 +617,45 @@ fn apply_action_failed(
     let payload = decode_action_failed(&event.payload).ok_or_else(|| {
         ExecutorError::Reducer("malformed action-failed event payload".into())
     })?;
-    // Defensive: only halt if this failure is for an action we emitted.
+    // Defensive: only act if this failure is for an action we emitted.
     // The workflow_id boundary already filters at the storage level, so
     // in practice this is always true. The check guards against
     // out-of-band manual events or buggy callers.
     let was_pending = state.pending_action_ids.remove(&payload.action_id).is_some();
+    let prior_depth = state
+        .action_compensation_depths
+        .remove(&payload.action_id)
+        .unwrap_or(0);
     if !was_pending {
         return Ok(());
     }
+
+    // M11f: compensate agent.* failures up to MAX_COMPENSATION_DEPTH.
+    // Status is preserved so derive_actions emits a fresh action of the
+    // same kind. github.* failures and depth-exhausted agent failures
+    // fall through to halt.
+    if is_compensable_kind(&payload.kind) && prior_depth < MAX_COMPENSATION_DEPTH {
+        let next_id = ActionId::derive(
+            &event.workflow_id,
+            event.sequence,
+            0,
+            &payload.kind,
+        );
+        let expected = expected_kind_for_action_kind(&payload.kind).ok_or_else(|| {
+            ExecutorError::Reducer(format!(
+                "compensable kind '{}' has no expected-outcome mapping",
+                payload.kind
+            ))
+        })?;
+        state
+            .pending_action_ids
+            .insert(next_id.clone(), expected);
+        state
+            .action_compensation_depths
+            .insert(next_id, prior_depth + 1);
+        return Ok(());
+    }
+
     halt(
         state,
         format!("action {} failed: {}", payload.kind, payload.last_error),
@@ -587,6 +663,36 @@ fn apply_action_failed(
         Some(payload.last_error),
     );
     Ok(())
+}
+
+/// Compensable iff the action targets the agent runner. github.*
+/// failures halt unconditionally (see `MAX_COMPENSATION_DEPTH` doc).
+fn is_compensable_kind(kind: &str) -> bool {
+    kind.starts_with("agent.")
+}
+
+fn expected_kind_for_action_kind(kind: &str) -> Option<ExpectedOutcomeKind> {
+    match kind {
+        KIND_AGENT_TRIAGE => Some(ExpectedOutcomeKind::Triage),
+        KIND_AGENT_PLANNER => Some(ExpectedOutcomeKind::Planner),
+        KIND_AGENT_ARCHITECT => Some(ExpectedOutcomeKind::Architect),
+        KIND_AGENT_CODER => Some(ExpectedOutcomeKind::Coder),
+        KIND_AGENT_REVIEWER => Some(ExpectedOutcomeKind::Reviewer),
+        KIND_AGENT_SECURITY_REVIEWER => Some(ExpectedOutcomeKind::SecurityReviewer),
+        _ => None,
+    }
+}
+
+/// Drop `action_id` from both pending-action tracking maps. Used by
+/// success/outcome handlers (so a compensated action's depth entry is
+/// freed once its outcome lands) and by the failure handler. Orphaned
+/// depth entries would be operationally harmless — fresh action_ids
+/// are derived from a unique (workflow_id, sequence, idx, kind) tuple
+/// and never collide with prior chains — but cleaning up keeps tests
+/// and snapshot inspection honest.
+fn complete_pending(state: &mut WorkflowState, action_id: &ActionId) {
+    state.pending_action_ids.remove(action_id);
+    state.action_compensation_depths.remove(action_id);
 }
 
 fn halt(
@@ -602,6 +708,7 @@ fn halt(
         last_error,
     });
     state.pending_action_ids.clear();
+    state.action_compensation_depths.clear();
 }
 
 fn decode_err(e: serde_json::Error) -> ExecutorError {

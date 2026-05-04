@@ -440,36 +440,335 @@ fn budget_under_cap_does_not_halt() {
 }
 
 #[test]
-fn action_failed_event_for_pending_action_halts() {
+fn first_agent_failure_compensates_with_fresh_action() {
+    // M11f: an `agent.*` permanent failure on a pending action triggers
+    // a single compensation. Status is preserved, a fresh action is
+    // pre-registered (with depth 1), and derive_actions emits the
+    // matching agent action — same kind, action_id derived from the
+    // failure event's sequence.
     let r = WorkflowReducer;
     let mut state = WorkflowState::default();
     let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
     state = r.reduce(state, &ev0).unwrap();
     assert_eq!(state.status, WorkflowStatus::Triaging);
 
-    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    let original_triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    assert!(state.pending_action_ids.contains_key(&original_triage_id));
 
-    // Synthesize an action.failed.v1 event.
-    let failure_payload = json!({
-        "action_id": triage_id.0,
-        "kind": KIND_AGENT_TRIAGE,
-        "original_payload": null,
-        "payload_truncated": false,
-        "final_state": "failed",
-        "last_error": "agent service unreachable",
-        "attempts": 5,
-        "probe_attempts": 0,
-    });
-    let ev1 = make_envelope(
+    let fail_ev = make_envelope(
         1,
         orchestrator_core::EVT_ACTION_FAILED,
-        failure_payload,
+        json!({
+            "action_id": original_triage_id.0,
+            "kind": KIND_AGENT_TRIAGE,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "agent service unreachable",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
     );
-    state = r.reduce(state, &ev1).unwrap();
+    state = r.reduce(state, &fail_ev).unwrap();
+
+    // Status preserved; old action removed; new action registered at
+    // depth 1.
+    assert_eq!(state.status, WorkflowStatus::Triaging);
+    assert!(state.failure.is_none());
+    assert!(!state.pending_action_ids.contains_key(&original_triage_id));
+    let compensated_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_TRIAGE);
+    assert!(state.pending_action_ids.contains_key(&compensated_id));
+    assert_eq!(
+        state.action_compensation_depths.get(&compensated_id).copied(),
+        Some(1)
+    );
+
+    // derive_actions on the failure event emits the fresh agent action.
+    let actions = r.derive_actions(&state, &fail_ev).unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, KIND_AGENT_TRIAGE);
+}
+
+#[test]
+fn second_agent_failure_for_same_chain_halts() {
+    // M11f: `MAX_COMPENSATION_DEPTH = 1`. A second permanent failure on
+    // the compensated action exhausts the chain and the workflow halts.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    state = r
+        .reduce(
+            state,
+            &make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload()),
+        )
+        .unwrap();
+    let original_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+
+    // First failure → compensate.
+    let fail_ev_1 = make_envelope(
+        1,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": original_id.0,
+            "kind": KIND_AGENT_TRIAGE,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "first failure",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &fail_ev_1).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Triaging);
+
+    // Second failure on the compensated action → halt.
+    let compensated_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_TRIAGE);
+    let fail_ev_2 = make_envelope(
+        2,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": compensated_id.0,
+            "kind": KIND_AGENT_TRIAGE,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "second failure",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &fail_ev_2).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let f = state.failure.clone().unwrap();
+    assert!(f.reason.contains(KIND_AGENT_TRIAGE));
+    assert_eq!(f.last_error.as_deref(), Some("second failure"));
+    // Halt clears both maps.
+    assert!(state.pending_action_ids.is_empty());
+    assert!(state.action_compensation_depths.is_empty());
+
+    // derive_actions on the halting event emits no further work.
+    let actions = r.derive_actions(&state, &fail_ev_2).unwrap();
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn github_action_failure_halts_unconditionally() {
+    // M11f: `github.*` failures halt without compensation. The decision
+    // is encoded in `is_compensable_kind`, which keys off the `agent.`
+    // prefix.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    state = r
+        .reduce(
+            state,
+            &make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload()),
+        )
+        .unwrap();
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                1,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_id.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                2,
+                EVT_PLAN_PROPOSED,
+                json!({
+                    "action_id": planner_id.0,
+                    "tasks": [{ "description": "task", "files_in_scope": [] }],
+                }),
+            ),
+        )
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::EnsuringBranch);
+    let ensure_id = ActionId::derive(&workflow_id(), 2, 0, KIND_ENSURE_BRANCH);
+    assert!(state.pending_action_ids.contains_key(&ensure_id));
+
+    let fail_ev = make_envelope(
+        3,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": ensure_id.0,
+            "kind": KIND_ENSURE_BRANCH,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "github 500",
+            "attempts": 5,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &fail_ev).unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
     let f = state.failure.unwrap();
-    assert!(f.reason.contains(KIND_AGENT_TRIAGE));
-    assert_eq!(f.last_error.as_deref(), Some("agent service unreachable"));
+    assert!(f.reason.contains(KIND_ENSURE_BRANCH));
+}
+
+#[test]
+fn agent_probe_exhausted_compensates_like_action_failed() {
+    // M11f: probe exhaustion is also a permanent terminal state and
+    // gets the same compensation treatment for agent.* kinds.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    state = r
+        .reduce(
+            state,
+            &make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload()),
+        )
+        .unwrap();
+    let original_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+
+    let probe_ev = make_envelope(
+        1,
+        orchestrator_core::EVT_ACTION_PROBE_EXHAUSTED,
+        json!({
+            "action_id": original_id.0,
+            "kind": KIND_AGENT_TRIAGE,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed_probe_exhausted",
+            "last_error": "probe network errors",
+            "attempts": 0,
+            "probe_attempts": 40,
+        }),
+    );
+    state = r.reduce(state, &probe_ev).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Triaging);
+
+    let compensated_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_TRIAGE);
+    assert!(state.pending_action_ids.contains_key(&compensated_id));
+    assert_eq!(
+        state.action_compensation_depths.get(&compensated_id).copied(),
+        Some(1)
+    );
+    let actions = r.derive_actions(&state, &probe_ev).unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, KIND_AGENT_TRIAGE);
+}
+
+#[test]
+fn compensated_action_can_succeed_and_resume_workflow() {
+    // M11f: after compensation, the new action's outcome is processed
+    // normally and the workflow advances. Successful path: triage fails,
+    // compensates, and the compensated action's TriageCompleted moves
+    // us to Planning.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    state = r
+        .reduce(
+            state,
+            &make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload()),
+        )
+        .unwrap();
+    let original_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    let fail_ev = make_envelope(
+        1,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": original_id.0,
+            "kind": KIND_AGENT_TRIAGE,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "blip",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &fail_ev).unwrap();
+    let compensated_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_TRIAGE);
+
+    let success_ev = make_envelope(
+        2,
+        EVT_TRIAGE_COMPLETED,
+        json!({"action_id": compensated_id.0, "accepted": true}),
+    );
+    state = r.reduce(state, &success_ev).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Planning);
+    // Compensated action's depth entry is dropped when it completes.
+    assert!(!state.action_compensation_depths.contains_key(&compensated_id));
+}
+
+#[test]
+fn unrelated_agent_chains_do_not_share_compensation_budget() {
+    // M11f / Codex round-2 B: depth is per-action-chain, not per-kind.
+    // A coder action that compensates and succeeds for task 0 must
+    // not deny a fresh task-1 coder its compensation budget.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    state = r
+        .reduce(
+            state,
+            &make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload()),
+        )
+        .unwrap();
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+
+    // Compensate triage once, then succeed.
+    let fail_ev = make_envelope(
+        1,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": triage_id.0,
+            "kind": KIND_AGENT_TRIAGE,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "blip",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &fail_ev).unwrap();
+    let triage_v2 = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                2,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_v2.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Planning);
+
+    // A fresh planner action (different chain entirely) should still
+    // get one compensation when it fails.
+    let planner_id = ActionId::derive(&workflow_id(), 2, 0, KIND_AGENT_PLANNER);
+    assert!(state.pending_action_ids.contains_key(&planner_id));
+    assert!(!state.action_compensation_depths.contains_key(&planner_id));
+
+    let planner_fail = make_envelope(
+        3,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": planner_id.0,
+            "kind": KIND_AGENT_PLANNER,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "another blip",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &planner_fail).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Planning);
+    let planner_v2 = ActionId::derive(&workflow_id(), 3, 0, KIND_AGENT_PLANNER);
+    assert_eq!(
+        state.action_compensation_depths.get(&planner_v2).copied(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -783,7 +1082,9 @@ fn failure_mid_multi_task_halts() {
     assert_eq!(state.status, WorkflowStatus::Coding);
     assert_eq!(state.current_task, Some(1));
 
-    // Task 1: agent.run_coder permanently fails. Reducer halts.
+    // Task 1: agent.run_coder permanently fails. M11f: first failure
+    // compensates (current_task preserved as 1, status preserved as
+    // Coding); a second failure on the compensated action halts.
     let coder_id_1 = ActionId::derive(&workflow_id(), 5, 0, KIND_AGENT_CODER);
     state = r
         .reduce(
@@ -804,10 +1105,35 @@ fn failure_mid_multi_task_halts() {
             ),
         )
         .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Coding);
+    assert_eq!(state.current_task, Some(1));
+
+    let coder_id_1_v2 = ActionId::derive(&workflow_id(), 6, 0, KIND_AGENT_CODER);
+    assert!(state.pending_action_ids.contains_key(&coder_id_1_v2));
+
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                7,
+                orchestrator_core::EVT_ACTION_FAILED,
+                json!({
+                    "action_id": coder_id_1_v2.0,
+                    "kind": KIND_AGENT_CODER,
+                    "original_payload": null,
+                    "payload_truncated": false,
+                    "final_state": "failed",
+                    "last_error": "still unreachable",
+                    "attempts": 20,
+                    "probe_attempts": 0,
+                }),
+            ),
+        )
+        .unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
     let f = state.failure.unwrap();
     assert!(f.reason.contains(KIND_AGENT_CODER));
-    assert_eq!(f.last_error.as_deref(), Some("agent unreachable"));
+    assert_eq!(f.last_error.as_deref(), Some("still unreachable"));
 }
 
 // ── M11d: review iteration loops ───────────────────────────────────────
@@ -1259,17 +1585,18 @@ fn architecture_review_skipped_when_not_required() {
 }
 
 #[test]
-fn architect_action_failure_halts_via_action_failed_event() {
-    // Codex round-1 F: failure-event routing for the new architect
-    // ExpectedOutcomeKind. If the architect agent permanently fails,
-    // the EVT_ACTION_FAILED event matches against pending_action_ids
-    // and halts the workflow.
+fn architect_action_failure_compensates_then_halts() {
+    // M11f: the architect is an `agent.*` kind, so a permanent failure
+    // first compensates (status preserved), and only a second failure
+    // halts. This also covers Codex round-1 F (failure-event routing
+    // for the architect ExpectedOutcomeKind).
     let r = WorkflowReducer;
     let mut state = drive_to_architecting(&r);
     let architect_id = ActionId::derive(&workflow_id(), 2, 0, KIND_AGENT_ARCHITECT);
     assert!(state.pending_action_ids.contains_key(&architect_id));
 
-    let fail_ev = make_envelope(
+    // First failure → compensate; status preserved as Architecting.
+    let fail_ev_1 = make_envelope(
         3,
         orchestrator_core::EVT_ACTION_FAILED,
         json!({
@@ -1283,11 +1610,31 @@ fn architect_action_failure_halts_via_action_failed_event() {
             "probe_attempts": 0,
         }),
     );
-    state = r.reduce(state, &fail_ev).unwrap();
+    state = r.reduce(state, &fail_ev_1).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Architecting);
+    let architect_v2 = ActionId::derive(&workflow_id(), 3, 0, KIND_AGENT_ARCHITECT);
+    assert!(state.pending_action_ids.contains_key(&architect_v2));
+
+    // Second failure on the compensated action → halt.
+    let fail_ev_2 = make_envelope(
+        4,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": architect_v2.0,
+            "kind": KIND_AGENT_ARCHITECT,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "still unreachable",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &fail_ev_2).unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
     let f = state.failure.unwrap();
     assert!(f.reason.contains(KIND_AGENT_ARCHITECT));
-    assert_eq!(f.last_error.as_deref(), Some("architect agent unreachable"));
+    assert_eq!(f.last_error.as_deref(), Some("still unreachable"));
 }
 
 fn drive_to_architecting(r: &WorkflowReducer) -> WorkflowState {

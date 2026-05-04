@@ -78,6 +78,19 @@ pub struct WorkflowState {
     /// multiple instances of the same kind exist over a workflow lifetime.
     #[serde(default)]
     pub pending_action_ids: HashMap<ActionId, ExpectedOutcomeKind>,
+
+    /// M11f: per-action-chain compensation depth. When an `agent.*` action
+    /// permanently fails, the reducer emits a fresh action with the same
+    /// kind at the same status, and records the new action_id here with
+    /// `prior_depth + 1`. Capped by `reducer::MAX_COMPENSATION_DEPTH` —
+    /// once exceeded, the workflow halts. Fresh (non-compensation) actions
+    /// are not recorded here; lookup defaults to depth 0.
+    ///
+    /// Per-chain (per-action_id) rather than per-kind: each agent run has
+    /// its own root cause, so unrelated coder failures across tasks/review
+    /// iterations don't share a budget (Codex round-2 pushback).
+    #[serde(default)]
+    pub action_compensation_depths: HashMap<ActionId, u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]

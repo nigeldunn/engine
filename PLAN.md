@@ -4,6 +4,18 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
+**Milestone 11f of the GitHub sink plan: COMPLETE.**
+
+Failure compensation for agent actions. When an `agent.*` action permanently fails (`EVT_ACTION_FAILED` or `EVT_ACTION_PROBE_EXHAUSTED`), the reducer emits a fresh action of the same kind at the same status, instead of halting. Cap is `MAX_COMPENSATION_DEPTH = 1` — single-shot safety net for transient infrastructure failures, not a prolonged second attempt at a genuinely failing plan. github.* failures still halt unconditionally.
+
+- State addition (additive, `#[serde(default)]`): `WorkflowState.action_compensation_depths: HashMap<ActionId, u32>`. Per-action-chain depth (Codex round-2 B): unrelated coder runs across tasks/review iterations don't share a budget. Fresh actions are not recorded here; lookup defaults to depth 0.
+- `apply_action_failed`: on a pending failure, look up depth. If kind `starts_with("agent.")` and depth < cap, derive a new action_id at `(workflow_id, event.sequence, 0, kind)`, register with depth + 1, preserve status. Else halt as before.
+- `derive_actions`: new `EVT_ACTION_FAILED | EVT_ACTION_PROBE_EXHAUSTED` arm dispatches by status alone (Codex round-2 G — each agent-waiting status maps 1:1 to one agent kind). Halted workflows have status = Failed which is_terminal short-circuits, so reaching the arm always means compensation.
+- `complete_pending` helper drops both pending_action_ids and action_compensation_depths together; halt clears both maps.
+- Why cap = 1: agent retry budgets are already huge (CODER 50 attempts × 5min cap ≈ hours, AGENT 20 × ≈ 1-2h). A second compensation gives 4× — excessive (Codex round-2 C).
+- 5 new happy_path tests + 2 existing tests rewritten (architect_action_failure & failure_mid_multi_task now exercise compensate-then-halt). Tests cover: first-failure compensation, depth-exhausted halt, github halt unconditional, probe_exhausted compensates, post-compensation success, per-chain isolation.
+- 27 reducer tests pass (was 22 after M11e; +5). Workspace clippy --all-targets -- -D warnings clean. No state_version bump.
+
 **Milestone 11e of the GitHub sink plan: COMPLETE.**
 
 Architecture review step. Optional architect agent runs between Planning and EnsuringBranch when the workflow opts in via `TicketIngested.require_architecture_review = true`. The architect sees the proposed plan and gates it; pass advances to EnsuringBranch as before, rejection halts (iteration deferred to a future milestone).
@@ -186,7 +198,8 @@ Deferred from v1:
 Each item is independently mergeable. The reducer accommodates these as additive changes.
 
 - **Triage `Indeterminate` paths.** Currently triage is binary accept/reject; add a third "needs_more_info" path that emits a human-escalation action.
-- **Failure compensation beyond halt.** On certain failure types (e.g., reviewer agent unreachable), retry a fresh agent run rather than halting outright.
+- **Compensation telemetry event.** M11f tracks compensation depth in state but emits no synthetic event marking "compensation activated". Operators currently infer it from a failure event followed by a fresh action of the same kind. A dedicated `core.compensation.activated.v1` (or similar) would simplify dashboards and alerting; not load-bearing for correctness.
+- **Higher compensation depths or per-kind tuning.** `MAX_COMPENSATION_DEPTH = 1` is one-size-fits-all. If operational data shows certain agents (e.g., reviewer) benefit from a second compensation, lift the cap to a per-kind config field.
 - **Security review iteration.** Currently security findings halt; could iterate similarly to M11d's reviewer loop.
 - **Architecture review iteration.** Currently architect rejection halts; could iterate similar to M11d. Add when concrete need emerges.
 - **Architecture approach summary threading.** v1 architect is a pure gate; threading structured architectural decisions into downstream coder payloads would require a new field on state and event-payload changes.
