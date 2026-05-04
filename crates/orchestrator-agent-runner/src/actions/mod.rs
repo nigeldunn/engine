@@ -2,6 +2,7 @@
 //! that the sink uses to dispatch execute/probe through the shared
 //! `dispatch` module.
 
+pub mod architect;
 pub mod coder;
 pub mod planner;
 pub mod reviewer;

@@ -15,14 +15,16 @@ use orchestrator_github::{
 use serde_json::Value as Json;
 
 use crate::action_kinds::{
-    KIND_AGENT_CODER, KIND_AGENT_PLANNER, KIND_AGENT_REVIEWER, KIND_AGENT_SECURITY_REVIEWER,
-    KIND_AGENT_TRIAGE, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH, KIND_OPEN_PR,
+    KIND_AGENT_ARCHITECT, KIND_AGENT_CODER, KIND_AGENT_PLANNER, KIND_AGENT_REVIEWER,
+    KIND_AGENT_SECURITY_REVIEWER, KIND_AGENT_TRIAGE, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH,
+    KIND_OPEN_PR,
 };
 use crate::events::{
-    decode, BudgetConsumed, CoderOutput, PlanProposed, PrMerged, ReviewerOutput, Severity,
-    SecurityReviewerOutput, TicketIngested, TriageCompleted, EVT_BUDGET_CONSUMED,
-    EVT_CODER_OUTPUT, EVT_PLAN_PROPOSED, EVT_PR_MERGED, EVT_REVIEWER_OUTPUT,
-    EVT_SECURITY_REVIEWER_OUTPUT, EVT_TICKET_INGESTED, EVT_TRIAGE_COMPLETED,
+    decode, ArchitectureProposed, BudgetConsumed, CoderOutput, PlanProposed, PrMerged,
+    ReviewerOutput, Severity, SecurityReviewerOutput, TicketIngested, TriageCompleted,
+    EVT_ARCHITECTURE_PROPOSED, EVT_BUDGET_CONSUMED, EVT_CODER_OUTPUT, EVT_PLAN_PROPOSED,
+    EVT_PR_MERGED, EVT_REVIEWER_OUTPUT, EVT_SECURITY_REVIEWER_OUTPUT, EVT_TICKET_INGESTED,
+    EVT_TRIAGE_COMPLETED,
 };
 use crate::state::{
     ExpectedOutcomeKind, FailureInfo, Plan, WorkflowState, WorkflowStatus,
@@ -81,6 +83,7 @@ impl Reducer for WorkflowReducer {
             EVT_TICKET_INGESTED => apply_ticket_ingested(&mut state, event)?,
             EVT_TRIAGE_COMPLETED => apply_triage_completed(&mut state, event)?,
             EVT_PLAN_PROPOSED => apply_plan_proposed(&mut state, event)?,
+            EVT_ARCHITECTURE_PROPOSED => apply_architecture_proposed(&mut state, event)?,
             EVT_GH_BRANCH_ENSURED => apply_branch_ensured(&mut state, event)?,
             EVT_CODER_OUTPUT => apply_coder_output(&mut state, event)?,
             EVT_GH_COMMIT_PUSHED => apply_commit_pushed(&mut state, event)?,
@@ -124,6 +127,17 @@ impl Reducer for WorkflowReducer {
                 vec![build_planner_action(triggering_event, new_state)]
             }
             EVT_PLAN_PROPOSED if new_state.status == WorkflowStatus::EnsuringBranch => {
+                vec![build_ensure_branch_action(triggering_event, new_state)?]
+            }
+            // M11e: opt-in architecture review path. apply_plan_proposed
+            // sets status = Architecting when require_architecture_review,
+            // emit run_architect.
+            EVT_PLAN_PROPOSED if new_state.status == WorkflowStatus::Architecting => {
+                vec![build_architect_action(triggering_event, new_state)]
+            }
+            // Architecture approved → ensure_branch (same builder as the
+            // direct path; the architect doesn't change the branch shape).
+            EVT_ARCHITECTURE_PROPOSED if new_state.status == WorkflowStatus::EnsuringBranch => {
                 vec![build_ensure_branch_action(triggering_event, new_state)?]
             }
             EVT_GH_BRANCH_ENSURED if new_state.status == WorkflowStatus::Coding => {
@@ -176,6 +190,7 @@ fn apply_ticket_ingested(
     state.base_branch = Some(p.base_branch);
     state.base_sha = Some(p.base_sha);
     state.cost_budget_cents = p.cost_budget_cents;
+    state.require_architecture_review = p.require_architecture_review;
 
     if state.budget_exhausted() {
         halt(state, "budget exhausted at ingestion".into(), None, None);
@@ -238,12 +253,59 @@ fn apply_plan_proposed(
 
     state.plan = Some(Plan { tasks: p.tasks });
     state.current_task = Some(0);
+
+    // M11e: opt-in architecture review. Branch here, not in derive_actions,
+    // so state.status reflects what we're actually waiting on.
+    if state.require_architecture_review {
+        state.status = WorkflowStatus::Architecting;
+        let action_id =
+            ActionId::derive(&event.workflow_id, event.sequence, 0, KIND_AGENT_ARCHITECT);
+        state
+            .pending_action_ids
+            .insert(action_id, ExpectedOutcomeKind::Architect);
+    } else {
+        state.status = WorkflowStatus::EnsuringBranch;
+        let action_id =
+            ActionId::derive(&event.workflow_id, event.sequence, 0, KIND_ENSURE_BRANCH);
+        state
+            .pending_action_ids
+            .insert(action_id, ExpectedOutcomeKind::EnsureBranch);
+    }
+    Ok(())
+}
+
+fn apply_architecture_proposed(
+    state: &mut WorkflowState,
+    event: &EventEnvelope,
+) -> Result<(), ExecutorError> {
+    if state.status != WorkflowStatus::Architecting {
+        return Ok(());
+    }
+    let p: ArchitectureProposed = decode(&event.payload).map_err(decode_err)?;
+    state.pending_action_ids.remove(&p.action_id);
+
+    if !p.accepted {
+        // v1: halt on rejection. M11f could iterate (similar to M11d).
+        halt(
+            state,
+            format!(
+                "architecture rejected: {}",
+                p.feedback.unwrap_or_else(|| "no feedback".into())
+            ),
+            Some(p.action_id),
+            None,
+        );
+        return Ok(());
+    }
+    // Approved → proceed to ensure_branch. Pre-register the next
+    // action_id (Codex round-1 E) so failure events for ensure_branch
+    // route correctly.
     state.status = WorkflowStatus::EnsuringBranch;
-    let action_id =
+    let next_id =
         ActionId::derive(&event.workflow_id, event.sequence, 0, KIND_ENSURE_BRANCH);
     state
         .pending_action_ids
-        .insert(action_id, ExpectedOutcomeKind::EnsureBranch);
+        .insert(next_id, ExpectedOutcomeKind::EnsureBranch);
     Ok(())
 }
 
@@ -570,6 +632,24 @@ fn build_planner_action(event: &EventEnvelope, state: &WorkflowState) -> Action 
     });
     Action {
         kind: KIND_AGENT_PLANNER.into(),
+        payload,
+        delay_seconds: 0,
+        max_attempts: AGENT_MAX_ATTEMPTS,
+        max_probe_attempts: AGENT_MAX_PROBE_ATTEMPTS,
+    }
+    .with_event_for_id_check(event)
+}
+
+fn build_architect_action(event: &EventEnvelope, state: &WorkflowState) -> Action {
+    // Pass plan + ticket context. The architect agent sees what's about
+    // to be implemented and can flag concerns before any code is written.
+    let payload = serde_json::json!({
+        "ticket": state.ticket,
+        "repo": state.repo,
+        "plan": state.plan,
+    });
+    Action {
+        kind: KIND_AGENT_ARCHITECT.into(),
         payload,
         delay_seconds: 0,
         max_attempts: AGENT_MAX_ATTEMPTS,

@@ -19,6 +19,7 @@ pub const EVT_TICKET_INGESTED: &str = "workflow.ticket_ingested.v1";
 
 pub const EVT_TRIAGE_COMPLETED: &str = "agent.triage.completed.v1";
 pub const EVT_PLAN_PROPOSED: &str = "agent.plan.proposed.v1";
+pub const EVT_ARCHITECTURE_PROPOSED: &str = "agent.architecture.proposed.v1";
 pub const EVT_CODER_OUTPUT: &str = "agent.coder.output.v1";
 pub const EVT_REVIEWER_OUTPUT: &str = "agent.reviewer.output.v1";
 pub const EVT_SECURITY_REVIEWER_OUTPUT: &str = "agent.security_reviewer.output.v1";
@@ -44,6 +45,13 @@ pub struct TicketIngested {
     /// Optional ceiling on cumulative agent cost. `None` means no cap;
     /// `Some(0)` would halt before the first agent runs.
     pub cost_budget_cents: Option<u64>,
+    /// Opt in to the architecture-review step (M11e). When `true`, the
+    /// reducer transitions Planning → Architecting (running an architect
+    /// agent) before EnsuringBranch. When absent or `false`, the
+    /// workflow goes straight to EnsuringBranch as in M11d. Old events
+    /// without this field default to `false` (existing flow).
+    #[serde(default)]
+    pub require_architecture_review: bool,
 }
 
 // ── agent outputs ───────────────────────────────────────────────────────
@@ -72,6 +80,21 @@ pub struct TaskSpec {
     /// Advisory hint for the coder agent — non-binding.
     #[serde(default)]
     pub files_in_scope: Vec<String>,
+}
+
+/// Output from the architect agent. v1 is a pass/fail gate: `accepted`
+/// = true advances to EnsuringBranch; `accepted` = false halts the
+/// workflow with the feedback in the failure record. M11f could iterate
+/// on rejection (similar to M11d's reviewer loop) but the v1 design is
+/// "approve before coding starts" — feedback isn't threaded into
+/// downstream coder payloads, only used for halt-reason logging.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArchitectureProposed {
+    pub action_id: ActionId,
+    pub accepted: bool,
+    /// `Some(_)` typically when accepted == false (architectural concerns).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,6 +248,21 @@ pub fn plan_proposed_event(
     request_id: Option<String>,
 ) -> EventCommand {
     build_event_command(workflow_id, action_id, EVT_PLAN_PROPOSED, body, request_id)
+}
+
+pub fn architecture_proposed_event(
+    workflow_id: &WorkflowId,
+    action_id: &ActionId,
+    body: &ArchitectureProposed,
+    request_id: Option<String>,
+) -> EventCommand {
+    build_event_command(
+        workflow_id,
+        action_id,
+        EVT_ARCHITECTURE_PROPOSED,
+        body,
+        request_id,
+    )
 }
 
 pub fn coder_output_event(

@@ -12,6 +12,7 @@
 
 pub const KIND_AGENT_TRIAGE: &str = "agent.run_triage";
 pub const KIND_AGENT_PLANNER: &str = "agent.run_planner";
+pub const KIND_AGENT_ARCHITECT: &str = "agent.run_architect";
 pub const KIND_AGENT_CODER: &str = "agent.run_coder";
 pub const KIND_AGENT_REVIEWER: &str = "agent.run_reviewer";
 pub const KIND_AGENT_SECURITY_REVIEWER: &str = "agent.run_security_reviewer";

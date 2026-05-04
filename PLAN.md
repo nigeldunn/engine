@@ -4,6 +4,20 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
+**Milestone 11e of the GitHub sink plan: COMPLETE.**
+
+Architecture review step. Optional architect agent runs between Planning and EnsuringBranch when the workflow opts in via `TicketIngested.require_architecture_review = true`. The architect sees the proposed plan and gates it; pass advances to EnsuringBranch as before, rejection halts (iteration deferred to a future milestone).
+
+- `KIND_AGENT_ARCHITECT = "agent.run_architect"` in action_kinds.rs.
+- `ArchitectureProposed { action_id, accepted, feedback }` event + `architecture_proposed_event` constructor in events.rs. v1 is a pass/fail gate — feedback is used only in the halt reason, not threaded into downstream coder payloads.
+- `WorkflowStatus::Architecting` new state variant; `ExpectedOutcomeKind::Architect` for failure-event routing; `WorkflowState.require_architecture_review: bool` cached at ingestion (Codex round-1 C: set exactly once, never re-read from log).
+- `apply_ticket_ingested` reads the new field. `apply_plan_proposed` branches on it to choose Architecting vs EnsuringBranch. `apply_architecture_proposed` halts on rejection or pre-registers ensure_branch action_id and advances on pass (Codex round-1 E).
+- `derive_actions` adds two arms: `EVT_PLAN_PROPOSED if status == Architecting` → run_architect; `EVT_ARCHITECTURE_PROPOSED if status == EnsuringBranch` → ensure_branch.
+- `build_architect_action` includes the plan in the payload so the architect can review the proposed approach. Uses AGENT_MAX_* (20/40) — architect is a non-coder agent.
+- `orchestrator-agent-runner`: new `actions/architect.rs` spec; ALL_KINDS and spec_for_kind extended.
+- 5 new happy_path tests + 1 architect-failure-routing test (Codex round-1 F): runs architect after plan, passes through to ensure_branch on accept, halts on reject, skips when not required, fails through EVT_ACTION_FAILED routing.
+- 260 tests pass workspace-wide (was 255 after M11d; +5). cargo build / clippy --all-targets -- -D warnings clean. No state_version bump (purely additive: new optional field, new enum variants by name, additive event type).
+
 **Milestone 11d of the GitHub sink plan: COMPLETE.**
 
 Review iteration loops. Reviewer rejection no longer halts the workflow — instead, the reducer transitions back to `Coding{task=0}` with the reviewer's feedback in state, and the next coder action's payload includes both the feedback and the iteration count. Capped at `MAX_REVIEW_ITERATIONS = 5` to bound runaway agent costs.
@@ -167,14 +181,15 @@ Deferred from v1:
 - `github.update_pr_branch` (atomic multi-commit — reducer emits separate `commit_patch` actions instead)
 - `github.merge_pr` (humans merge; orchestrator observes via webhook)
 
-### Milestone 11e+: Workflow reducer extensions (remaining)
+### Milestone 11f+: Workflow reducer extensions (remaining)
 
 Each item is independently mergeable. The reducer accommodates these as additive changes.
 
-- **Architecture review step.** Optional intermediate state between Planning and EnsuringBranch where an architecture agent runs.
 - **Triage `Indeterminate` paths.** Currently triage is binary accept/reject; add a third "needs_more_info" path that emits a human-escalation action.
 - **Failure compensation beyond halt.** On certain failure types (e.g., reviewer agent unreachable), retry a fresh agent run rather than halting outright.
 - **Security review iteration.** Currently security findings halt; could iterate similarly to M11d's reviewer loop.
+- **Architecture review iteration.** Currently architect rejection halts; could iterate similar to M11d. Add when concrete need emerges.
+- **Architecture approach summary threading.** v1 architect is a pure gate; threading structured architectural decisions into downstream coder payloads would require a new field on state and event-payload changes.
 - **Task DAG.** Currently tasks are an ordered linear list; lifting to a true DAG with declared dependencies would let independent tasks run in parallel.
 
 ## Open design questions for later
@@ -231,3 +246,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 12c (orchestrator-agent-runner crate): 5 Sink impls for agent.run_* kinds via shared AgentSpec dispatch. AgentClient trait + HttpAgentClient default impl (POST /run/{type}, GET /status/{type}/{id}, GET /healthz). Per-call request_id (UUID v7) sent as X-Request-Id and stamped on outcome trace_id for local correlation. BudgetConsumed side events emitted when cost reported (zero-cost or missing-cost graceful no-op). 18 new tests via mock AgentClient cover happy/error paths, probe states, health classification, kind routing, request-id propagation. 249 tests workspace-wide.
 - Milestone 11c (multi-task plans): single-task constraint lifted. Reducer accepts plans with N >= 1 tasks; each task runs sequentially with one commit per task, chained on state.head_sha. apply_commit_pushed branches on current_task + 1 < total_tasks; defensive bounds guard halts on overflow. Empty plan still halts. Existing single-task tests pass unchanged; 2 new tests for 3-task happy path and mid-multi-task failure halt. 251 tests workspace-wide.
 - Milestone 11d (review iteration loops): reviewer rejection no longer halts; transitions back to Coding{task=0} with feedback in state. MAX_REVIEW_ITERATIONS = 5 cap prevents runaway. State adds total_reviewer_rejections (lifetime telemetry counter) + last_review_feedback (cleared on pass). build_coder_action threads both into the payload. Multi-task plans restart from task 0 on rejection (full re-pass). Security reviewer unchanged. Pre-registers rerun coder action_id in pending_action_ids per Codex round-1 H. 4 new tests + 1 rename. 255 tests workspace-wide.
+- Milestone 11e (architecture review step): optional architect agent gate between Planning and EnsuringBranch via TicketIngested.require_architecture_review opt-in. New WorkflowStatus::Architecting + ExpectedOutcomeKind::Architect + ArchitectureProposed event. v1 is pass/fail (no iteration); architect's plan-context payload mirrors planner's. Agent runner gets a 6th spec via actions/architect.rs. 5 new happy-path tests + 1 architect-failure-routing test (Codex round-1 F). 260 tests workspace-wide.

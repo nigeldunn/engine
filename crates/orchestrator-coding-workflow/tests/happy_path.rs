@@ -1127,3 +1127,202 @@ fn multi_task_review_iteration_restarts_from_task_zero() {
     assert_eq!(state.total_reviewer_rejections, 1);
     assert_eq!(state.last_review_feedback.as_deref(), Some("go again"));
 }
+
+// ── M11e: architecture review step ──────────────────────────────────────
+
+fn ticket_ingested_with_arch_review() -> Value {
+    json!({
+        "ticket": { "source": "manual", "id": "ENG-123" },
+        "repo": { "owner": "octo", "name": "world" },
+        "base_branch": "main",
+        "base_sha": "0123456789abcdef0123456789abcdef01234567",
+        "cost_budget_cents": 100_000_u64,
+        "require_architecture_review": true,
+    })
+}
+
+#[test]
+fn architecture_review_required_runs_architect_after_plan() {
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_with_arch_review());
+    state = r.reduce(state, &ev0).unwrap();
+    assert!(state.require_architecture_review);
+
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                1,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_id.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    let plan_ev = make_envelope(
+        2,
+        EVT_PLAN_PROPOSED,
+        json!({
+            "action_id": planner_id.0,
+            "tasks": [{ "description": "task", "files_in_scope": [] }],
+        }),
+    );
+    state = r.reduce(state, &plan_ev).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Architecting);
+    let actions = r.derive_actions(&state, &plan_ev).unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, KIND_AGENT_ARCHITECT);
+    // The architect's payload includes the plan for review.
+    assert!(actions[0].payload["plan"].is_object());
+}
+
+#[test]
+fn architecture_review_passed_proceeds_to_ensure_branch() {
+    let r = WorkflowReducer;
+    let mut state = drive_to_architecting(&r);
+
+    let architect_id = ActionId::derive(&workflow_id(), 2, 0, KIND_AGENT_ARCHITECT);
+    let arch_ev = make_envelope(
+        3,
+        orchestrator_coding_workflow::EVT_ARCHITECTURE_PROPOSED,
+        json!({
+            "action_id": architect_id.0,
+            "accepted": true,
+        }),
+    );
+    state = r.reduce(state, &arch_ev).unwrap();
+    assert_eq!(state.status, WorkflowStatus::EnsuringBranch);
+    let actions = r.derive_actions(&state, &arch_ev).unwrap();
+    assert_eq!(actions[0].kind, KIND_ENSURE_BRANCH);
+}
+
+#[test]
+fn architecture_review_rejected_halts() {
+    let r = WorkflowReducer;
+    let mut state = drive_to_architecting(&r);
+
+    let architect_id = ActionId::derive(&workflow_id(), 2, 0, KIND_AGENT_ARCHITECT);
+    let arch_ev = make_envelope(
+        3,
+        orchestrator_coding_workflow::EVT_ARCHITECTURE_PROPOSED,
+        json!({
+            "action_id": architect_id.0,
+            "accepted": false,
+            "feedback": "approach uses deprecated library X",
+        }),
+    );
+    state = r.reduce(state, &arch_ev).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let f = state.failure.unwrap();
+    assert!(f.reason.contains("architecture rejected"));
+    assert!(f.reason.contains("deprecated library X"));
+}
+
+#[test]
+fn architecture_review_skipped_when_not_required() {
+    // Existing flow: ticket without require_architecture_review goes
+    // straight from Planning to EnsuringBranch (no Architecting state).
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
+    state = r.reduce(state, &ev0).unwrap();
+    assert!(!state.require_architecture_review);
+
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                1,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_id.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    let plan_ev = make_envelope(
+        2,
+        EVT_PLAN_PROPOSED,
+        json!({
+            "action_id": planner_id.0,
+            "tasks": [{ "description": "task", "files_in_scope": [] }],
+        }),
+    );
+    state = r.reduce(state, &plan_ev).unwrap();
+    assert_eq!(state.status, WorkflowStatus::EnsuringBranch);
+    let actions = r.derive_actions(&state, &plan_ev).unwrap();
+    assert_eq!(actions[0].kind, KIND_ENSURE_BRANCH);
+}
+
+#[test]
+fn architect_action_failure_halts_via_action_failed_event() {
+    // Codex round-1 F: failure-event routing for the new architect
+    // ExpectedOutcomeKind. If the architect agent permanently fails,
+    // the EVT_ACTION_FAILED event matches against pending_action_ids
+    // and halts the workflow.
+    let r = WorkflowReducer;
+    let mut state = drive_to_architecting(&r);
+    let architect_id = ActionId::derive(&workflow_id(), 2, 0, KIND_AGENT_ARCHITECT);
+    assert!(state.pending_action_ids.contains_key(&architect_id));
+
+    let fail_ev = make_envelope(
+        3,
+        orchestrator_core::EVT_ACTION_FAILED,
+        json!({
+            "action_id": architect_id.0,
+            "kind": KIND_AGENT_ARCHITECT,
+            "original_payload": null,
+            "payload_truncated": false,
+            "final_state": "failed",
+            "last_error": "architect agent unreachable",
+            "attempts": 20,
+            "probe_attempts": 0,
+        }),
+    );
+    state = r.reduce(state, &fail_ev).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let f = state.failure.unwrap();
+    assert!(f.reason.contains(KIND_AGENT_ARCHITECT));
+    assert_eq!(f.last_error.as_deref(), Some("architect agent unreachable"));
+}
+
+fn drive_to_architecting(r: &WorkflowReducer) -> WorkflowState {
+    let mut state = WorkflowState::default();
+    state = r
+        .reduce(
+            state,
+            &make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_with_arch_review()),
+        )
+        .unwrap();
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                1,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_id.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                2,
+                EVT_PLAN_PROPOSED,
+                json!({
+                    "action_id": planner_id.0,
+                    "tasks": [{ "description": "task", "files_in_scope": [] }],
+                }),
+            ),
+        )
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Architecting);
+    state
+}

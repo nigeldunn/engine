@@ -16,15 +16,16 @@ pub mod state;
 pub mod webhook;
 
 pub use action_kinds::{
-    KIND_AGENT_CODER, KIND_AGENT_PLANNER, KIND_AGENT_REVIEWER,
+    KIND_AGENT_ARCHITECT, KIND_AGENT_CODER, KIND_AGENT_PLANNER, KIND_AGENT_REVIEWER,
     KIND_AGENT_SECURITY_REVIEWER, KIND_AGENT_TRIAGE, KIND_COMMIT_PATCH, KIND_ENSURE_BRANCH,
     KIND_OPEN_PR,
 };
 pub use events::{
-    budget_consumed_event, coder_output_event, plan_proposed_event, reviewer_output_event,
-    security_reviewer_output_event, triage_completed_event, BudgetConsumed, CoderOutput,
-    FileChangeOutput, PatchOutput, PlanProposed, PrMerged, ReviewerOutput, SecurityFinding,
-    SecurityReviewerOutput, Severity, TaskSpec, TicketIngested, TicketRef, TriageCompleted,
+    architecture_proposed_event, budget_consumed_event, coder_output_event, plan_proposed_event,
+    reviewer_output_event, security_reviewer_output_event, triage_completed_event,
+    ArchitectureProposed, BudgetConsumed, CoderOutput, FileChangeOutput, PatchOutput,
+    PlanProposed, PrMerged, ReviewerOutput, SecurityFinding, SecurityReviewerOutput, Severity,
+    TaskSpec, TicketIngested, TicketRef, TriageCompleted, EVT_ARCHITECTURE_PROPOSED,
     EVT_BUDGET_CONSUMED, EVT_CODER_OUTPUT, EVT_PLAN_PROPOSED, EVT_PR_MERGED,
     EVT_REVIEWER_OUTPUT, EVT_SECURITY_REVIEWER_OUTPUT, EVT_TICKET_INGESTED, EVT_TRIAGE_COMPLETED,
 };

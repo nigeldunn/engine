@@ -51,6 +51,14 @@ pub struct WorkflowState {
     // Failure
     pub failure: Option<FailureInfo>,
 
+    /// M11e: cached from `TicketIngested.require_architecture_review`.
+    /// When `true`, `apply_plan_proposed` transitions to Architecting
+    /// (running an architect agent) instead of EnsuringBranch directly.
+    /// Set exactly once at ingestion time; never re-read from the event
+    /// log (reducer purity).
+    #[serde(default)]
+    pub require_architecture_review: bool,
+
     /// Lifetime count of reviewer rejections — increments on every
     /// `ReviewerOutput { passed: false }`. Compared against
     /// `MAX_REVIEW_ITERATIONS` to halt review thrashing. Not reset on a
@@ -79,6 +87,7 @@ pub enum WorkflowStatus {
     Empty, // no event ingested yet
     Triaging,
     Planning,
+    Architecting, // M11e: optional review of plan before coding starts
     EnsuringBranch,
     Coding,
     PushingCommit,
@@ -116,6 +125,7 @@ pub struct FailureInfo {
 pub enum ExpectedOutcomeKind {
     Triage,
     Planner,
+    Architect, // M11e: architect agent output
     EnsureBranch,
     Coder,
     CommitPatch,

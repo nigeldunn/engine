@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use orchestrator_coding_workflow::{
-    KIND_AGENT_CODER, KIND_AGENT_PLANNER, KIND_AGENT_REVIEWER, KIND_AGENT_SECURITY_REVIEWER,
-    KIND_AGENT_TRIAGE,
+    KIND_AGENT_ARCHITECT, KIND_AGENT_CODER, KIND_AGENT_PLANNER, KIND_AGENT_REVIEWER,
+    KIND_AGENT_SECURITY_REVIEWER, KIND_AGENT_TRIAGE,
 };
 use orchestrator_core::{
     AttemptOutcome, ClaimedAction, DispatcherError, ExistingResult, Sink, SinkHealthScope,
@@ -13,7 +13,7 @@ use orchestrator_core::{
 };
 use std::sync::Arc;
 
-use crate::actions::{coder, planner, reviewer, security_reviewer, triage};
+use crate::actions::{architect, coder, planner, reviewer, security_reviewer, triage};
 use crate::client::AgentClient;
 use crate::dispatch::{self, AgentSpec};
 use crate::errors::AgentError;
@@ -22,6 +22,7 @@ const SINK_KEY: &str = "agent-runner";
 const ALL_KINDS: &[&str] = &[
     KIND_AGENT_TRIAGE,
     KIND_AGENT_PLANNER,
+    KIND_AGENT_ARCHITECT,
     KIND_AGENT_CODER,
     KIND_AGENT_REVIEWER,
     KIND_AGENT_SECURITY_REVIEWER,
@@ -46,6 +47,7 @@ impl<C: AgentClient> AgentRunnerSink<C> {
         match kind {
             KIND_AGENT_TRIAGE => Some(&triage::SPEC),
             KIND_AGENT_PLANNER => Some(&planner::SPEC),
+            KIND_AGENT_ARCHITECT => Some(&architect::SPEC),
             KIND_AGENT_CODER => Some(&coder::SPEC),
             KIND_AGENT_REVIEWER => Some(&reviewer::SPEC),
             KIND_AGENT_SECURITY_REVIEWER => Some(&security_reviewer::SPEC),
