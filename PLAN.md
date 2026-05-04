@@ -4,6 +4,19 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
+**Milestone 11d of the GitHub sink plan: COMPLETE.**
+
+Review iteration loops. Reviewer rejection no longer halts the workflow — instead, the reducer transitions back to `Coding{task=0}` with the reviewer's feedback in state, and the next coder action's payload includes both the feedback and the iteration count. Capped at `MAX_REVIEW_ITERATIONS = 5` to bound runaway agent costs.
+
+- State additions (purely additive, `#[serde(default)]` on each): `total_reviewer_rejections: u32` workflow-lifetime counter; `last_review_feedback: Option<String>` cleared on pass.
+- `apply_reviewer_output` now branches on `passed`: false → increment counter, halt at cap, otherwise loop back to Coding{task=0} with feedback and pre-register the next coder action_id (Codex round-1 H — failure events match by action_id, so the rerun must be in pending_action_ids).
+- `derive_actions` extra `EVT_REVIEWER_OUTPUT if status == Coding` arm emits the next coder action.
+- `build_coder_action` payload threads `review_feedback` and `total_reviewer_rejections` so the agent can adjust prompting for retries.
+- Multi-task plans correctly reset `current_task = 0` on rejection — each iteration is a full pass through the plan.
+- Security reviewer rejection still halts (out of scope for M11d).
+- 4 new tests + 1 renamed test (`reviewer_rejection_halts_workflow` → `reviewer_rejection_loops_back_to_coding`).
+- 255 tests pass workspace-wide (was 251 after M11c; +4). cargo build / clippy --all-targets -- -D warnings clean. No state_version bump.
+
 **Milestone 11c of the GitHub sink plan: COMPLETE.**
 
 Multi-task plans. The single-task constraint from M11b is lifted; reducer now runs N tasks sequentially with one commit per task. Each commit chains on the previous via `state.head_sha`; on the last commit the reducer transitions to `Reviewing`.
@@ -154,14 +167,14 @@ Deferred from v1:
 - `github.update_pr_branch` (atomic multi-commit — reducer emits separate `commit_patch` actions instead)
 - `github.merge_pr` (humans merge; orchestrator observes via webhook)
 
-### Milestone 11d+: Workflow reducer extensions (remaining)
+### Milestone 11e+: Workflow reducer extensions (remaining)
 
 Each item is independently mergeable. The reducer accommodates these as additive changes.
 
-- **Review iteration loops.** On `ReviewerOutput { passed: false, feedback }`, instead of halting, transition back to `Coding` with the feedback in state. Track iteration count; cap to prevent infinite loops.
 - **Architecture review step.** Optional intermediate state between Planning and EnsuringBranch where an architecture agent runs.
 - **Triage `Indeterminate` paths.** Currently triage is binary accept/reject; add a third "needs_more_info" path that emits a human-escalation action.
 - **Failure compensation beyond halt.** On certain failure types (e.g., reviewer agent unreachable), retry a fresh agent run rather than halting outright.
+- **Security review iteration.** Currently security findings halt; could iterate similarly to M11d's reviewer loop.
 - **Task DAG.** Currently tasks are an ordered linear list; lifting to a true DAG with declared dependencies would let independent tasks run in parallel.
 
 ## Open design questions for later
@@ -217,3 +230,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 12b (per-agent-kind retry budgets): coding-workflow reducer sets max_attempts=50 / max_probe_attempts=60 for coder; 20/40 for other agents; github.* unchanged. Three named constant pairs; five builder updates. No new tests (covered by existing reducer suite). 231 tests workspace-wide.
 - Milestone 12c (orchestrator-agent-runner crate): 5 Sink impls for agent.run_* kinds via shared AgentSpec dispatch. AgentClient trait + HttpAgentClient default impl (POST /run/{type}, GET /status/{type}/{id}, GET /healthz). Per-call request_id (UUID v7) sent as X-Request-Id and stamped on outcome trace_id for local correlation. BudgetConsumed side events emitted when cost reported (zero-cost or missing-cost graceful no-op). 18 new tests via mock AgentClient cover happy/error paths, probe states, health classification, kind routing, request-id propagation. 249 tests workspace-wide.
 - Milestone 11c (multi-task plans): single-task constraint lifted. Reducer accepts plans with N >= 1 tasks; each task runs sequentially with one commit per task, chained on state.head_sha. apply_commit_pushed branches on current_task + 1 < total_tasks; defensive bounds guard halts on overflow. Empty plan still halts. Existing single-task tests pass unchanged; 2 new tests for 3-task happy path and mid-multi-task failure halt. 251 tests workspace-wide.
+- Milestone 11d (review iteration loops): reviewer rejection no longer halts; transitions back to Coding{task=0} with feedback in state. MAX_REVIEW_ITERATIONS = 5 cap prevents runaway. State adds total_reviewer_rejections (lifetime telemetry counter) + last_review_feedback (cleared on pass). build_coder_action threads both into the payload. Multi-task plans restart from task 0 on rejection (full re-pass). Security reviewer unchanged. Pre-registers rerun coder action_id in pending_action_ids per Codex round-1 H. 4 new tests + 1 rename. 255 tests workspace-wide.

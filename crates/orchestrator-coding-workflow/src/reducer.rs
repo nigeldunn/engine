@@ -48,6 +48,11 @@ const CODER_MAX_PROBE_ATTEMPTS: u32 = 60;
 const AGENT_MAX_ATTEMPTS: u32 = 20;
 const AGENT_MAX_PROBE_ATTEMPTS: u32 = 40;
 
+/// Hard cap on reviewer rejection cycles before the workflow halts.
+/// Typical workflows clear in 1-2 iterations; the cap is defensive
+/// against runaway agent costs from a perpetually-rejecting reviewer.
+const MAX_REVIEW_ITERATIONS: u32 = 5;
+
 // We're also subscribed to github outcome events emitted by the github sink.
 const EVT_GH_BRANCH_ENSURED: &str = orchestrator_github::EVT_BRANCH_ENSURED;
 const EVT_GH_COMMIT_PUSHED: &str = orchestrator_github::EVT_COMMIT_PUSHED;
@@ -139,6 +144,11 @@ impl Reducer for WorkflowReducer {
             }
             EVT_REVIEWER_OUTPUT if new_state.status == WorkflowStatus::SecurityReviewing => {
                 vec![build_security_reviewer_action(triggering_event, new_state)]
+            }
+            // Reviewer rejected: apply_reviewer_output transitioned back to
+            // Coding{task=0} with feedback in state. Re-run the coder.
+            EVT_REVIEWER_OUTPUT if new_state.status == WorkflowStatus::Coding => {
+                vec![build_coder_action(triggering_event, new_state)]
             }
             EVT_SECURITY_REVIEWER_OUTPUT if new_state.status == WorkflowStatus::OpeningPr => {
                 vec![build_open_pr_action(triggering_event, new_state)?]
@@ -365,17 +375,40 @@ fn apply_reviewer_output(
     state.pending_action_ids.remove(&p.action_id);
 
     if !p.passed {
-        halt(
-            state,
-            format!(
-                "reviewer rejected: {}",
-                p.feedback.unwrap_or_else(|| "no feedback".into())
-            ),
-            Some(p.action_id),
-            None,
-        );
+        // Iterate: re-run the coder with the reviewer's feedback. Capped
+        // to MAX_REVIEW_ITERATIONS to bound runaway agent costs.
+        state.total_reviewer_rejections =
+            state.total_reviewer_rejections.saturating_add(1);
+        if state.total_reviewer_rejections >= MAX_REVIEW_ITERATIONS {
+            halt(
+                state,
+                format!(
+                    "review budget exhausted after {} iterations",
+                    state.total_reviewer_rejections
+                ),
+                Some(p.action_id),
+                None,
+            );
+            return Ok(());
+        }
+        // Pre-register the next coder action_id (Codex round-1 H): the
+        // failure-event router matches by action_id against
+        // pending_action_ids, so a permanent failure on the rerun must
+        // resolve to a halt rather than be silently ignored.
+        state.last_review_feedback = p.feedback;
+        state.current_task = Some(0);
+        state.status = WorkflowStatus::Coding;
+        let next_id =
+            ActionId::derive(&event.workflow_id, event.sequence, 0, KIND_AGENT_CODER);
+        state
+            .pending_action_ids
+            .insert(next_id, ExpectedOutcomeKind::Coder);
         return Ok(());
     }
+
+    // Passed: clear feedback (no longer relevant). total_reviewer_rejections
+    // is left as a workflow-lifetime counter for telemetry.
+    state.last_review_feedback = None;
     state.status = WorkflowStatus::SecurityReviewing;
     let next_id = ActionId::derive(
         &event.workflow_id,
@@ -600,6 +633,12 @@ fn build_coder_action(_event: &EventEnvelope, state: &WorkflowState) -> Action {
         "repo": state.repo,
         "task_idx": task_idx,
         "task": task,
+        // M11d: review-iteration context. Both fields are always present
+        // so the agent service can pattern-match unconditionally;
+        // total_reviewer_rejections == 0 + null feedback signals
+        // first-time coding rather than a rerun.
+        "review_feedback": state.last_review_feedback,
+        "total_reviewer_rejections": state.total_reviewer_rejections,
     });
     Action {
         kind: KIND_AGENT_CODER.into(),

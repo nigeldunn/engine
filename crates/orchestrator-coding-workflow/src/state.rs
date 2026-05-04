@@ -51,6 +51,19 @@ pub struct WorkflowState {
     // Failure
     pub failure: Option<FailureInfo>,
 
+    /// Lifetime count of reviewer rejections — increments on every
+    /// `ReviewerOutput { passed: false }`. Compared against
+    /// `MAX_REVIEW_ITERATIONS` to halt review thrashing. Not reset on a
+    /// reviewer pass; useful for telemetry / post-mortems.
+    #[serde(default)]
+    pub total_reviewer_rejections: u32,
+
+    /// Feedback from the most recent reviewer rejection. Set on
+    /// rejection, threaded into the next coder action's payload, and
+    /// cleared once a reviewer pass lands.
+    #[serde(default)]
+    pub last_review_feedback: Option<String>,
+
     /// Outstanding action_ids the workflow has emitted, mapped to the
     /// kind it expects to receive an outcome from. Codex round-1 pushback:
     /// failure events must be matched by action_id, not kind, because

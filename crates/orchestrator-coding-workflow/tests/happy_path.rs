@@ -333,9 +333,10 @@ fn empty_plan_halts() {
 }
 
 #[test]
-fn reviewer_rejection_halts_workflow() {
+fn reviewer_rejection_loops_back_to_coding() {
     let r = WorkflowReducer;
     let mut state = drive_to_reviewing(&r);
+    assert_eq!(state.total_reviewer_rejections, 0);
 
     let reviewer_id = ActionId::derive(&workflow_id(), 5, 0, KIND_AGENT_REVIEWER);
     let ev = make_envelope(
@@ -348,8 +349,24 @@ fn reviewer_rejection_halts_workflow() {
         }),
     );
     state = r.reduce(state, &ev).unwrap();
-    assert_eq!(state.status, WorkflowStatus::Failed);
-    assert!(state.failure.unwrap().reason.contains("needs more tests"));
+
+    // Now loops back to Coding{task_idx=0} with feedback in state.
+    assert_eq!(state.status, WorkflowStatus::Coding);
+    assert_eq!(state.current_task, Some(0));
+    assert_eq!(state.total_reviewer_rejections, 1);
+    assert_eq!(state.last_review_feedback.as_deref(), Some("needs more tests"));
+    assert!(state.failure.is_none());
+
+    // derive_actions emits the next coder action with feedback in payload.
+    let actions = r.derive_actions(&state, &ev).unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].kind, KIND_AGENT_CODER);
+    let payload = &actions[0].payload;
+    assert_eq!(
+        payload["review_feedback"].as_str(),
+        Some("needs more tests")
+    );
+    assert_eq!(payload["total_reviewer_rejections"].as_u64(), Some(1));
 }
 
 #[test]
@@ -791,4 +808,322 @@ fn failure_mid_multi_task_halts() {
     let f = state.failure.unwrap();
     assert!(f.reason.contains(KIND_AGENT_CODER));
     assert_eq!(f.last_error.as_deref(), Some("agent unreachable"));
+}
+
+// ── M11d: review iteration loops ───────────────────────────────────────
+
+#[test]
+fn reviewer_rejection_then_pass_proceeds_to_security() {
+    let r = WorkflowReducer;
+    let mut state = drive_to_reviewing(&r);
+
+    // First reviewer call: reject.
+    let reviewer_id_1 = ActionId::derive(&workflow_id(), 5, 0, KIND_AGENT_REVIEWER);
+    let ev1 = make_envelope(
+        6,
+        EVT_REVIEWER_OUTPUT,
+        json!({
+            "action_id": reviewer_id_1.0,
+            "passed": false,
+            "feedback": "fix the thing",
+        }),
+    );
+    state = r.reduce(state, &ev1).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Coding);
+    assert_eq!(state.total_reviewer_rejections, 1);
+
+    // Coder runs again with feedback.
+    let coder_id = ActionId::derive(&workflow_id(), 6, 0, KIND_AGENT_CODER);
+    let ev2 = make_envelope(
+        7,
+        EVT_CODER_OUTPUT,
+        json!({
+            "action_id": coder_id.0,
+            "task_idx": 0,
+            "patch": { "files": [{ "path": "fix.rs", "content": "fixed" }] },
+            "notes": "addressed feedback",
+        }),
+    );
+    state = r.reduce(state, &ev2).unwrap();
+    assert_eq!(state.status, WorkflowStatus::PushingCommit);
+
+    // Commit lands.
+    let cp_id = ActionId::derive(&workflow_id(), 7, 0, KIND_COMMIT_PATCH);
+    let ev3 = make_envelope(
+        8,
+        orchestrator_github::EVT_COMMIT_PUSHED,
+        json!({
+            "action_id": cp_id.0,
+            "commit_sha": "f".repeat(40),
+            "head_sha_at_probe": "f".repeat(40),
+            "is_at_head": true,
+        }),
+    );
+    state = r.reduce(state, &ev3).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Reviewing);
+
+    // Second reviewer call: pass.
+    let reviewer_id_2 = ActionId::derive(&workflow_id(), 8, 0, KIND_AGENT_REVIEWER);
+    let ev4 = make_envelope(
+        9,
+        EVT_REVIEWER_OUTPUT,
+        json!({
+            "action_id": reviewer_id_2.0,
+            "passed": true,
+        }),
+    );
+    state = r.reduce(state, &ev4).unwrap();
+    assert_eq!(state.status, WorkflowStatus::SecurityReviewing);
+    // Feedback cleared on pass.
+    assert!(state.last_review_feedback.is_none());
+    // Counter retained as workflow-lifetime telemetry.
+    assert_eq!(state.total_reviewer_rejections, 1);
+    let actions = r.derive_actions(&state, &ev4).unwrap();
+    assert_eq!(actions[0].kind, KIND_AGENT_SECURITY_REVIEWER);
+}
+
+#[test]
+fn review_iteration_exhausts_at_cap() {
+    let r = WorkflowReducer;
+    let mut state = drive_to_reviewing(&r);
+
+    // Manually crank the counter to one below the cap, then hit the cap.
+    // Five rejections → halt (constant matches MAX_REVIEW_ITERATIONS = 5).
+    let mut seq = 6_u64;
+    for i in 0..5 {
+        let reviewer_id = ActionId::derive(&workflow_id(), seq - 1, 0, KIND_AGENT_REVIEWER);
+        let ev = make_envelope(
+            seq,
+            EVT_REVIEWER_OUTPUT,
+            json!({
+                "action_id": reviewer_id.0,
+                "passed": false,
+                "feedback": format!("iteration {}", i),
+            }),
+        );
+        state = r.reduce(state, &ev).unwrap();
+        seq += 1;
+
+        if i + 1 < 5 {
+            // Below the cap: loops back to Coding. Need to advance through
+            // coder_output + commit_pushed before the next reviewer event.
+            assert_eq!(state.status, WorkflowStatus::Coding);
+            assert_eq!(state.total_reviewer_rejections as usize, i + 1);
+
+            let coder_id = ActionId::derive(&workflow_id(), seq - 1, 0, KIND_AGENT_CODER);
+            state = r
+                .reduce(
+                    state,
+                    &make_envelope(
+                        seq,
+                        EVT_CODER_OUTPUT,
+                        json!({
+                            "action_id": coder_id.0,
+                            "task_idx": 0,
+                            "patch": { "files": [{ "path": "x", "content": "y" }] },
+                            "notes": "",
+                        }),
+                    ),
+                )
+                .unwrap();
+            seq += 1;
+
+            let cp_id = ActionId::derive(&workflow_id(), seq - 1, 0, KIND_COMMIT_PATCH);
+            state = r
+                .reduce(
+                    state,
+                    &make_envelope(
+                        seq,
+                        orchestrator_github::EVT_COMMIT_PUSHED,
+                        json!({
+                            "action_id": cp_id.0,
+                            "commit_sha": format!("{:040x}", i + 1),
+                            "head_sha_at_probe": format!("{:040x}", i + 1),
+                            "is_at_head": true,
+                        }),
+                    ),
+                )
+                .unwrap();
+            assert_eq!(state.status, WorkflowStatus::Reviewing);
+            seq += 1;
+        }
+    }
+
+    // After 5 rejections: budget exhausted, workflow halted.
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(state.total_reviewer_rejections, 5);
+    let f = state.failure.as_ref().unwrap();
+    assert!(f.reason.contains("review budget exhausted"));
+    let actions = r.derive_actions(&state, &make_envelope(seq, "irrelevant", json!({}))).unwrap();
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn first_coder_call_has_null_review_feedback() {
+    // Sanity: on the first coder run (before any review), the feedback
+    // field is null and total_reviewer_rejections is 0.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
+    state = r.reduce(state, &ev0).unwrap();
+
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                1,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_id.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                2,
+                EVT_PLAN_PROPOSED,
+                json!({
+                    "action_id": planner_id.0,
+                    "tasks": [{ "description": "task", "files_in_scope": [] }],
+                }),
+            ),
+        )
+        .unwrap();
+
+    let ensure_id = ActionId::derive(&workflow_id(), 2, 0, KIND_ENSURE_BRANCH);
+    let branch_ev = make_envelope(
+        3,
+        orchestrator_github::EVT_BRANCH_ENSURED,
+        json!({
+            "action_id": ensure_id.0,
+            "branch_name": "auto/eng-123/x",
+            "head_sha": "0".repeat(40),
+        }),
+    );
+    state = r.reduce(state, &branch_ev).unwrap();
+
+    // First coder action.
+    let actions = r.derive_actions(&state, &branch_ev).unwrap();
+    assert_eq!(actions[0].kind, KIND_AGENT_CODER);
+    let p = &actions[0].payload;
+    assert!(p["review_feedback"].is_null());
+    assert_eq!(p["total_reviewer_rejections"].as_u64(), Some(0));
+}
+
+#[test]
+fn multi_task_review_iteration_restarts_from_task_zero() {
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    state = r
+        .reduce(state, &make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload()))
+        .unwrap();
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                1,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_id.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                2,
+                EVT_PLAN_PROPOSED,
+                json!({
+                    "action_id": planner_id.0,
+                    "tasks": [
+                        { "description": "Task A", "files_in_scope": [] },
+                        { "description": "Task B", "files_in_scope": [] },
+                    ],
+                }),
+            ),
+        )
+        .unwrap();
+    let ensure_id = ActionId::derive(&workflow_id(), 2, 0, KIND_ENSURE_BRANCH);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                3,
+                orchestrator_github::EVT_BRANCH_ENSURED,
+                json!({
+                    "action_id": ensure_id.0,
+                    "branch_name": "auto/multi-iter",
+                    "head_sha": "0".repeat(40),
+                }),
+            ),
+        )
+        .unwrap();
+
+    // Run both tasks to land 2 commits → status Reviewing, current_task = 1.
+    let mut seq = 4_u64;
+    for task_idx in 0..2 {
+        let coder_id = ActionId::derive(&workflow_id(), seq - 1, 0, KIND_AGENT_CODER);
+        state = r
+            .reduce(
+                state,
+                &make_envelope(
+                    seq,
+                    EVT_CODER_OUTPUT,
+                    json!({
+                        "action_id": coder_id.0,
+                        "task_idx": task_idx,
+                        "patch": { "files": [{ "path": format!("t{}.txt", task_idx), "content": "v" }] },
+                        "notes": "",
+                    }),
+                ),
+            )
+            .unwrap();
+        seq += 1;
+        let cp_id = ActionId::derive(&workflow_id(), seq - 1, 0, KIND_COMMIT_PATCH);
+        state = r
+            .reduce(
+                state,
+                &make_envelope(
+                    seq,
+                    orchestrator_github::EVT_COMMIT_PUSHED,
+                    json!({
+                        "action_id": cp_id.0,
+                        "commit_sha": format!("{:040x}", task_idx + 1),
+                        "head_sha_at_probe": format!("{:040x}", task_idx + 1),
+                        "is_at_head": true,
+                    }),
+                ),
+            )
+            .unwrap();
+        seq += 1;
+    }
+    assert_eq!(state.status, WorkflowStatus::Reviewing);
+    assert_eq!(state.current_task, Some(1));
+
+    // Reviewer rejects. current_task should reset to 0.
+    let reviewer_id = ActionId::derive(&workflow_id(), seq - 1, 0, KIND_AGENT_REVIEWER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                seq,
+                EVT_REVIEWER_OUTPUT,
+                json!({
+                    "action_id": reviewer_id.0,
+                    "passed": false,
+                    "feedback": "go again",
+                }),
+            ),
+        )
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Coding);
+    assert_eq!(state.current_task, Some(0));
+    assert_eq!(state.total_reviewer_rejections, 1);
+    assert_eq!(state.last_review_feedback.as_deref(), Some("go again"));
 }
