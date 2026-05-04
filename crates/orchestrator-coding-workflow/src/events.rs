@@ -60,8 +60,9 @@ pub struct TriageCompleted {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlanProposed {
     pub action_id: ActionId,
-    /// In M11b v1 the reducer rejects `tasks.len() != 1`. M11c lifts
-    /// this to support multi-task plans.
+    /// One or more tasks; the reducer rejects an empty plan. Tasks are
+    /// run sequentially with one commit per task; M11d will add the
+    /// reviewer-iteration loop on rejection.
     pub tasks: Vec<TaskSpec>,
 }
 

@@ -4,6 +4,18 @@ Roadmap and current state. Update this as you go so the next session can pick up
 
 ## Where we are
 
+**Milestone 11c of the GitHub sink plan: COMPLETE.**
+
+Multi-task plans. The single-task constraint from M11b is lifted; reducer now runs N tasks sequentially with one commit per task. Each commit chains on the previous via `state.head_sha`; on the last commit the reducer transitions to `Reviewing`.
+
+- `apply_plan_proposed`: `tasks.len() != 1` halt removed; empty plan (`tasks.len() == 0`) still halts (planner bug). Plans with N >= 1 tasks are accepted.
+- `apply_commit_pushed`: branches on `current_task + 1 < total_tasks` — increments task index and re-emits `agent.run_coder` if more remain, else advances to `Reviewing`. Defensive bounds guard halts on out-of-range `current_task`.
+- `derive_actions`: extra `EVT_GH_COMMIT_PUSHED if status == Coding` arm emits the next-task coder action; the existing `Reviewing` arm still emits the reviewer.
+- 2 new tests: `three_task_plan_runs_through_all_tasks_to_review` (verifies each task's run_coder + commit_patch + correct status transition + final review) and `failure_mid_multi_task_halts` (task 0 commits; agent.run_coder for task 1 fails → workflow halts with last_error preserved).
+- 1 test renamed: `multi_task_plan_halts_in_v1` → `empty_plan_halts` (now triggered by `tasks: []` instead of `tasks.len() == 2`).
+- Stale `PlanProposed` doc comment updated.
+- 251 tests pass workspace-wide (was 249 after M12c; +2). cargo build / clippy --all-targets -- -D warnings clean. No state_version bump needed — change is purely additive.
+
 **Milestone 12c of the GitHub sink plan: COMPLETE.**
 
 Agent runner sinks. New crate `orchestrator-agent-runner` connects the workflow reducer's `agent.run_*` actions to actual agent services. With M12a's side-event mechanism + M12b's per-agent retry budgets + M12c's sinks, the engine can now drive a coding workflow end-to-end: reducer emits agent actions → sinks call agent services → outcome events update the workflow state → next agent action emitted.
@@ -142,16 +154,15 @@ Deferred from v1:
 - `github.update_pr_branch` (atomic multi-commit — reducer emits separate `commit_patch` actions instead)
 - `github.merge_pr` (humans merge; orchestrator observes via webhook)
 
-### Milestone 11c+: Workflow reducer extensions (deferred from M11b)
+### Milestone 11d+: Workflow reducer extensions (remaining)
 
-Each item is independently mergeable. M11b's linear single-task design accommodates these as additive changes.
+Each item is independently mergeable. The reducer accommodates these as additive changes.
 
-- **Multi-task plans.** Lift `tasks.len() != 1` halt; cycle through tasks with explicit task_idx routing. Reducer adds a `Coding { task_idx }`-style state distinguishing tasks. Adds the per-task DAG.
 - **Review iteration loops.** On `ReviewerOutput { passed: false, feedback }`, instead of halting, transition back to `Coding` with the feedback in state. Track iteration count; cap to prevent infinite loops.
 - **Architecture review step.** Optional intermediate state between Planning and EnsuringBranch where an architecture agent runs.
 - **Triage `Indeterminate` paths.** Currently triage is binary accept/reject; add a third "needs_more_info" path that emits a human-escalation action.
 - **Failure compensation beyond halt.** On certain failure types (e.g., reviewer agent unreachable), retry a fresh agent run rather than halting outright.
-- **Cost-from-agents wiring.** M12 agent sinks emit `BudgetConsumed` events; this is the M12 contract, not M11c.
+- **Task DAG.** Currently tasks are an ordered linear list; lifting to a true DAG with declared dependencies would let independent tasks run in parallel.
 
 ## Open design questions for later
 
@@ -205,3 +216,4 @@ When ending a session, update the "Where we are" section to reflect what was com
 - Milestone 12a (side events on AttemptOutcome + per-action max_probe_attempts): two small core extensions. AttemptOutcome::Succeeded and ExistingResult gain side_events: Vec<EventCommand>; dispatcher writes outcome event first then iterates side events. Action gains max_probe_attempts (default 20). 13 outcome construction sites + 11 Action construction sites updated workspace-wide. 1 new test verifying outcome-then-side ordering. 231 tests workspace-wide.
 - Milestone 12b (per-agent-kind retry budgets): coding-workflow reducer sets max_attempts=50 / max_probe_attempts=60 for coder; 20/40 for other agents; github.* unchanged. Three named constant pairs; five builder updates. No new tests (covered by existing reducer suite). 231 tests workspace-wide.
 - Milestone 12c (orchestrator-agent-runner crate): 5 Sink impls for agent.run_* kinds via shared AgentSpec dispatch. AgentClient trait + HttpAgentClient default impl (POST /run/{type}, GET /status/{type}/{id}, GET /healthz). Per-call request_id (UUID v7) sent as X-Request-Id and stamped on outcome trace_id for local correlation. BudgetConsumed side events emitted when cost reported (zero-cost or missing-cost graceful no-op). 18 new tests via mock AgentClient cover happy/error paths, probe states, health classification, kind routing, request-id propagation. 249 tests workspace-wide.
+- Milestone 11c (multi-task plans): single-task constraint lifted. Reducer accepts plans with N >= 1 tasks; each task runs sequentially with one commit per task, chained on state.head_sha. apply_commit_pushed branches on current_task + 1 < total_tasks; defensive bounds guard halts on overflow. Empty plan still halts. Existing single-task tests pass unchanged; 2 new tests for 3-task happy path and mid-multi-task failure halt. 251 tests workspace-wide.

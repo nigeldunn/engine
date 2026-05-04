@@ -130,6 +130,13 @@ impl Reducer for WorkflowReducer {
             EVT_GH_COMMIT_PUSHED if new_state.status == WorkflowStatus::Reviewing => {
                 vec![build_reviewer_action(triggering_event, new_state)]
             }
+            // Multi-task plan: commit landed but more tasks remain →
+            // run the coder for the next task. apply_commit_pushed has
+            // already advanced state.current_task and set status =
+            // Coding, so build_coder_action sees the new task index.
+            EVT_GH_COMMIT_PUSHED if new_state.status == WorkflowStatus::Coding => {
+                vec![build_coder_action(triggering_event, new_state)]
+            }
             EVT_REVIEWER_OUTPUT if new_state.status == WorkflowStatus::SecurityReviewing => {
                 vec![build_security_reviewer_action(triggering_event, new_state)]
             }
@@ -209,13 +216,10 @@ fn apply_plan_proposed(
     let p: PlanProposed = decode(&event.payload).map_err(decode_err)?;
     state.pending_action_ids.remove(&p.action_id);
 
-    if p.tasks.len() != 1 {
+    if p.tasks.is_empty() {
         halt(
             state,
-            format!(
-                "M11b v1 supports single-task plans only; got {} tasks",
-                p.tasks.len()
-            ),
+            "planner produced an empty plan (zero tasks)".into(),
             Some(p.action_id),
             None,
         );
@@ -311,11 +315,42 @@ fn apply_commit_pushed(
         state.pending_action_ids.remove(aid);
     }
 
-    state.status = WorkflowStatus::Reviewing;
-    let next_id = ActionId::derive(&event.workflow_id, event.sequence, 0, KIND_AGENT_REVIEWER);
-    state
-        .pending_action_ids
-        .insert(next_id, ExpectedOutcomeKind::Reviewer);
+    // Branch on whether more tasks remain. Defensive bounds guard
+    // (Codex round-1 H): if current_task somehow exceeds plan.tasks.len(),
+    // halt rather than silently advance into undefined slots.
+    let total_tasks = state.plan.as_ref().map(|p| p.tasks.len()).unwrap_or(0);
+    let current = state.current_task.unwrap_or(0);
+    if current >= total_tasks {
+        halt(
+            state,
+            format!(
+                "current_task {} out of bounds (plan has {} tasks)",
+                current, total_tasks
+            ),
+            None,
+            None,
+        );
+        return Ok(());
+    }
+
+    if current + 1 < total_tasks {
+        // More tasks remain — advance to the next coder run.
+        state.current_task = Some(current + 1);
+        state.status = WorkflowStatus::Coding;
+        let next_id =
+            ActionId::derive(&event.workflow_id, event.sequence, 0, KIND_AGENT_CODER);
+        state
+            .pending_action_ids
+            .insert(next_id, ExpectedOutcomeKind::Coder);
+    } else {
+        // All tasks committed — proceed to review.
+        state.status = WorkflowStatus::Reviewing;
+        let next_id =
+            ActionId::derive(&event.workflow_id, event.sequence, 0, KIND_AGENT_REVIEWER);
+        state
+            .pending_action_ids
+            .insert(next_id, ExpectedOutcomeKind::Reviewer);
+    }
     Ok(())
 }
 

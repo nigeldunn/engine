@@ -299,7 +299,7 @@ fn triage_rejection_halts_workflow() {
 }
 
 #[test]
-fn multi_task_plan_halts_in_v1() {
+fn empty_plan_halts() {
     let r = WorkflowReducer;
     let mut state = WorkflowState::default();
     let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
@@ -319,10 +319,7 @@ fn multi_task_plan_halts_in_v1() {
         EVT_PLAN_PROPOSED,
         json!({
             "action_id": planner_id.0,
-            "tasks": [
-                { "description": "Task 1", "files_in_scope": [] },
-                { "description": "Task 2", "files_in_scope": [] },
-            ],
+            "tasks": [],
         }),
     );
     state = r.reduce(state, &ev2).unwrap();
@@ -332,7 +329,7 @@ fn multi_task_plan_halts_in_v1() {
         .as_ref()
         .unwrap()
         .reason
-        .contains("single-task"));
+        .contains("empty plan"));
 }
 
 #[test]
@@ -568,3 +565,230 @@ fn drive_to_security_reviewing(r: &WorkflowReducer) -> WorkflowState {
 
 #[allow(dead_code)]
 fn _silence(_r: &RepoRef) {}
+
+// ── M11c: multi-task plans ─────────────────────────────────────────────
+
+#[test]
+fn three_task_plan_runs_through_all_tasks_to_review() {
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+
+    // 1. Ingest + triage + plan with 3 tasks.
+    let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
+    state = r.reduce(state, &ev0).unwrap();
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    let ev1 = make_envelope(
+        1,
+        EVT_TRIAGE_COMPLETED,
+        json!({"action_id": triage_id.0, "accepted": true}),
+    );
+    state = r.reduce(state, &ev1).unwrap();
+
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    let ev2 = make_envelope(
+        2,
+        EVT_PLAN_PROPOSED,
+        json!({
+            "action_id": planner_id.0,
+            "tasks": [
+                { "description": "Task A", "files_in_scope": [] },
+                { "description": "Task B", "files_in_scope": [] },
+                { "description": "Task C", "files_in_scope": [] },
+            ],
+        }),
+    );
+    state = r.reduce(state, &ev2).unwrap();
+    assert_eq!(state.status, WorkflowStatus::EnsuringBranch);
+    assert_eq!(state.plan.as_ref().unwrap().tasks.len(), 3);
+
+    // 2. Branch ensured → Coding{0}, emit run_coder for task 0.
+    let ensure_id = ActionId::derive(&workflow_id(), 2, 0, KIND_ENSURE_BRANCH);
+    let ev3 = make_envelope(
+        3,
+        orchestrator_github::EVT_BRANCH_ENSURED,
+        json!({
+            "action_id": ensure_id.0,
+            "branch_name": "auto/eng-123/multi",
+            "head_sha": "0".repeat(40),
+        }),
+    );
+    state = r.reduce(state, &ev3).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Coding);
+    assert_eq!(state.current_task, Some(0));
+    let actions = r.derive_actions(&state, &ev3).unwrap();
+    assert_eq!(actions[0].kind, KIND_AGENT_CODER);
+
+    // 3. Loop through 3 tasks. Each iteration: coder_output → commit_patch → commit_pushed.
+    let mut sequence: u64 = 4;
+    let mut prev_commit_sha = "0".repeat(40);
+    for task_idx in 0..3 {
+        let coder_id =
+            ActionId::derive(&workflow_id(), sequence - 1, 0, KIND_AGENT_CODER);
+        let coder_ev = make_envelope(
+            sequence,
+            EVT_CODER_OUTPUT,
+            json!({
+                "action_id": coder_id.0,
+                "task_idx": task_idx,
+                "patch": { "files": [{ "path": format!("task{}.txt", task_idx), "content": "x" }] },
+                "notes": "",
+            }),
+        );
+        state = r.reduce(state, &coder_ev).unwrap();
+        assert_eq!(state.status, WorkflowStatus::PushingCommit);
+        let actions = r.derive_actions(&state, &coder_ev).unwrap();
+        assert_eq!(actions[0].kind, KIND_COMMIT_PATCH);
+        sequence += 1;
+
+        let commit_id =
+            ActionId::derive(&workflow_id(), sequence - 1, 0, KIND_COMMIT_PATCH);
+        let new_commit_sha = format!("{:040x}", task_idx + 1);
+        let commit_ev = make_envelope(
+            sequence,
+            orchestrator_github::EVT_COMMIT_PUSHED,
+            json!({
+                "action_id": commit_id.0,
+                "commit_sha": new_commit_sha,
+                "head_sha_at_probe": new_commit_sha,
+                "is_at_head": true,
+            }),
+        );
+        state = r.reduce(state, &commit_ev).unwrap();
+        prev_commit_sha = new_commit_sha;
+        sequence += 1;
+
+        if task_idx + 1 < 3 {
+            // More tasks: should be in Coding for the next task.
+            assert_eq!(state.status, WorkflowStatus::Coding);
+            assert_eq!(state.current_task, Some(task_idx + 1));
+            let next_actions = r.derive_actions(&state, &commit_ev).unwrap();
+            assert_eq!(next_actions.len(), 1);
+            assert_eq!(next_actions[0].kind, KIND_AGENT_CODER);
+        } else {
+            // Last task done: should be in Reviewing.
+            assert_eq!(state.status, WorkflowStatus::Reviewing);
+            let next_actions = r.derive_actions(&state, &commit_ev).unwrap();
+            assert_eq!(next_actions[0].kind, KIND_AGENT_REVIEWER);
+        }
+    }
+
+    // After all 3 tasks, head_sha is the third commit's sha.
+    assert_eq!(state.head_sha.as_deref(), Some(prev_commit_sha.as_str()));
+    assert!(state.failure.is_none());
+}
+
+#[test]
+fn failure_mid_multi_task_halts() {
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
+    state = r.reduce(state, &ev0).unwrap();
+
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                1,
+                EVT_TRIAGE_COMPLETED,
+                json!({"action_id": triage_id.0, "accepted": true}),
+            ),
+        )
+        .unwrap();
+
+    let planner_id = ActionId::derive(&workflow_id(), 1, 0, KIND_AGENT_PLANNER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                2,
+                EVT_PLAN_PROPOSED,
+                json!({
+                    "action_id": planner_id.0,
+                    "tasks": [
+                        { "description": "Task A", "files_in_scope": [] },
+                        { "description": "Task B", "files_in_scope": [] },
+                    ],
+                }),
+            ),
+        )
+        .unwrap();
+
+    let ensure_id = ActionId::derive(&workflow_id(), 2, 0, KIND_ENSURE_BRANCH);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                3,
+                orchestrator_github::EVT_BRANCH_ENSURED,
+                json!({
+                    "action_id": ensure_id.0,
+                    "branch_name": "auto/eng-123/midfail",
+                    "head_sha": "0".repeat(40),
+                }),
+            ),
+        )
+        .unwrap();
+
+    // Task 0: succeed.
+    let coder_id_0 = ActionId::derive(&workflow_id(), 3, 0, KIND_AGENT_CODER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                4,
+                EVT_CODER_OUTPUT,
+                json!({
+                    "action_id": coder_id_0.0,
+                    "task_idx": 0,
+                    "patch": { "files": [{ "path": "a.txt", "content": "a" }] },
+                    "notes": "",
+                }),
+            ),
+        )
+        .unwrap();
+    let cp_id_0 = ActionId::derive(&workflow_id(), 4, 0, KIND_COMMIT_PATCH);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                5,
+                orchestrator_github::EVT_COMMIT_PUSHED,
+                json!({
+                    "action_id": cp_id_0.0,
+                    "commit_sha": "1".repeat(40),
+                    "head_sha_at_probe": "1".repeat(40),
+                    "is_at_head": true,
+                }),
+            ),
+        )
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Coding);
+    assert_eq!(state.current_task, Some(1));
+
+    // Task 1: agent.run_coder permanently fails. Reducer halts.
+    let coder_id_1 = ActionId::derive(&workflow_id(), 5, 0, KIND_AGENT_CODER);
+    state = r
+        .reduce(
+            state,
+            &make_envelope(
+                6,
+                orchestrator_core::EVT_ACTION_FAILED,
+                json!({
+                    "action_id": coder_id_1.0,
+                    "kind": KIND_AGENT_CODER,
+                    "original_payload": null,
+                    "payload_truncated": false,
+                    "final_state": "failed",
+                    "last_error": "agent unreachable",
+                    "attempts": 20,
+                    "probe_attempts": 0,
+                }),
+            ),
+        )
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let f = state.failure.unwrap();
+    assert!(f.reason.contains(KIND_AGENT_CODER));
+    assert_eq!(f.last_error.as_deref(), Some("agent unreachable"));
+}
