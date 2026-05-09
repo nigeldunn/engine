@@ -150,6 +150,25 @@ impl Storage {
         if let Err(sqlx::Error::Database(db_err)) = &result {
             if db_err.is_unique_violation() {
                 tx.rollback().await?;
+                // Disambiguate: a UNIQUE violation may be on the
+                // composite (workflow_id, sequence) primary key (a real
+                // sequence conflict — caller should retry) OR on the
+                // partial unique index over `ingress_dedup_key` (a
+                // race-loser where the winner just committed). The
+                // post-rollback lookup tells us which: if a row now
+                // exists for our dedup key, the dedup index fired and
+                // we surface as deduplicated. Otherwise it was the PK.
+                //
+                // Without this short-circuit, dedup-races bounce
+                // through `Executor::advance`'s SequenceConflict retry
+                // loop and only converge on the next attempt (when the
+                // top-of-tx dedup-lookup catches the now-visible row).
+                if let Some(outcome) =
+                    classify_unique_violation(&self.pool, cmd.ingress_dedup_key.as_deref())
+                        .await?
+                {
+                    return Ok(outcome);
+                }
                 return Err(ExecutorError::SequenceConflict);
             }
         }
@@ -1129,6 +1148,41 @@ async fn lookup_by_dedup_key(
     }))
 }
 
+/// Inspect the events table on a fresh pool connection to determine
+/// whether a UNIQUE-violation in `Storage::advance` was the
+/// `ingress_dedup_key` index (race-loser) or the `(workflow_id,
+/// sequence)` primary key (real sequence conflict). Called *after* the
+/// transaction has been rolled back — the post-rollback view sees the
+/// race-winner's committed row.
+///
+/// Returns `Ok(Some(outcome))` if a row now exists for the dedup key,
+/// signalling the caller to surface a deduplicated outcome.
+/// `Ok(None)` means the violation was on a different unique index
+/// (typically the sequence PK), so the caller should fall through to
+/// `SequenceConflict`.
+pub(crate) async fn classify_unique_violation(
+    pool: &SqlitePool,
+    dedup_key: Option<&str>,
+) -> Result<Option<AdvanceOutcome>, ExecutorError> {
+    let Some(key) = dedup_key else {
+        // No dedup key on this command; the violation can't be from
+        // the partial unique index, so it must be the sequence PK.
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT event_id, sequence FROM events WHERE ingress_dedup_key = ? LIMIT 1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| AdvanceOutcome {
+        event_id: EventId(r.get::<String, _>("event_id")),
+        sequence: r.get::<i64, _>("sequence") as u64,
+        actions_enqueued: vec![],
+        deduplicated: true,
+    }))
+}
+
 async fn insert_outbox_row(
     tx: &mut Transaction<'_, sqlx::Sqlite>,
     action_id: &ActionId,
@@ -1204,4 +1258,97 @@ fn backoff_duration(attempt: u32) -> ChronoDuration {
     let capped = exp.min(max_ms);
     let jitter = rand::thread_rng().gen_range(0..=(capped / 4));
     ChronoDuration::milliseconds((capped + jitter) as i64)
+}
+#[cfg(test)]
+mod classify_violation_tests {
+    use super::*;
+    use crate::reducer::Reducer;
+    use serde::{Deserialize, Serialize};
+
+    /// Minimal trivial reducer so we can exercise advance() without
+    /// pulling in a real workflow reducer.
+    struct NoopReducer;
+
+    #[derive(Clone, Default, Serialize, Deserialize)]
+    struct Empty;
+
+    #[async_trait::async_trait]
+    impl Reducer for NoopReducer {
+        type State = Empty;
+
+        fn state_version(&self) -> u32 { 1 }
+
+        fn reduce(
+            &self,
+            state: Self::State,
+            _event: &EventEnvelope,
+        ) -> Result<Self::State, ExecutorError> {
+            Ok(state)
+        }
+
+        fn derive_actions(
+            &self,
+            _state: &Self::State,
+            _event: &EventEnvelope,
+        ) -> Result<Vec<Action>, ExecutorError> {
+            Ok(vec![])
+        }
+    }
+
+    fn cmd(workflow: &str, dedup_key: Option<&str>) -> EventCommand {
+        EventCommand {
+            workflow_id: WorkflowId::new(workflow),
+            payload_type: "test.v1".into(),
+            payload_schema_version: 1,
+            payload: serde_json::json!({"k": "v"}),
+            causation: Causation::External {
+                source: "test".into(),
+                request_id: "r".into(),
+            },
+            trace_id: None,
+            ingress_dedup_key: dedup_key.map(String::from),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_returns_some_when_dedup_row_exists() {
+        let storage = Storage::open("sqlite::memory:").await.unwrap();
+        // Land an event so a row exists in the events table with our
+        // dedup key. Going through advance is the simplest seeding.
+        let outcome = storage
+            .advance(&NoopReducer, &cmd("wf-A", Some("dk-A")))
+            .await
+            .unwrap();
+        assert!(!outcome.deduplicated);
+
+        let result = classify_unique_violation(storage.pool(), Some("dk-A"))
+            .await
+            .unwrap()
+            .expect("dedup key should be findable");
+        assert!(result.deduplicated);
+        assert_eq!(result.event_id, outcome.event_id);
+        assert_eq!(result.sequence, outcome.sequence);
+    }
+
+    #[tokio::test]
+    async fn classify_returns_none_when_dedup_key_is_absent() {
+        let storage = Storage::open("sqlite::memory:").await.unwrap();
+        // No dedup key on the cmd at all → cannot have been a dedup
+        // index violation; classifier returns None so the caller
+        // surfaces SequenceConflict.
+        let result = classify_unique_violation(storage.pool(), None).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn classify_returns_none_when_dedup_row_does_not_exist() {
+        let storage = Storage::open("sqlite::memory:").await.unwrap();
+        // Dedup key supplied but no matching row was ever written.
+        // The violation must therefore have been on a different unique
+        // index (i.e., the sequence PK).
+        let result = classify_unique_violation(storage.pool(), Some("never-written"))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
 }
