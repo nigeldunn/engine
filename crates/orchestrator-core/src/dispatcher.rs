@@ -135,6 +135,16 @@ impl<R: Reducer> Dispatcher<R> {
 
             tokio::select! {
                 _ = self.shutdown.notified() => {
+                    // The caller's `notify_one()` only woke ONE of the two
+                    // waiters on this Notify (main loop + health loop).
+                    // `notify_waiters()` wakes any peer currently pending;
+                    // `notify_one()` leaves a permit so a peer that
+                    // hasn't yet re-registered also wakes when it does.
+                    // Without both, whichever consumer wins the race
+                    // strands the other and `health_handle.await` blocks
+                    // forever.
+                    self.shutdown.notify_waiters();
+                    self.shutdown.notify_one();
                     info!("shutdown signal received, draining {} in-flight", handles.len());
                     for h in handles {
                         let _ = h.await;
@@ -530,6 +540,11 @@ async fn health_check_loop<R: Reducer>(
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
+                // Symmetric to the main loop: re-broadcast in case we
+                // won the race against the main loop's `notified()`,
+                // so the main loop also exits its select! on shutdown.
+                shutdown.notify_waiters();
+                shutdown.notify_one();
                 debug!("health check loop stopping");
                 return;
             }

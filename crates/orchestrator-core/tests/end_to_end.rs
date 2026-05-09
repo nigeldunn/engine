@@ -401,6 +401,47 @@ async fn indeterminate_health_check_preserves_state() {
     assert_eq!(record.detail.as_deref(), Some("before"));
 }
 
+/// Regression for the dispatcher shutdown bug: `Notify::notify_one()` only
+/// wakes one waiter, but the dispatcher has two (`run` loop + health loop)
+/// sharing the same Arc<Notify>. Without rebroadcasting in the run loop's
+/// shutdown branch, `health_handle.await` blocks forever and the join
+/// never resolves. Asserts the join completes promptly (well under one
+/// second on any sane host).
+#[tokio::test]
+async fn dispatcher_shutdown_completes_promptly() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let executor = Arc::new(Executor::new(storage, CounterReducer));
+    let mut dispatcher = Dispatcher::new(
+        executor,
+        DispatcherConfig {
+            poll_interval: Duration::from_millis(50),
+            // Long health interval so the test exits via the shutdown
+            // path, not via the health loop happening to fire on its own.
+            health_check_interval: Duration::from_secs(60),
+            ..Default::default()
+        },
+    );
+    let (sink, _handles) = CountingSink::new_with_handles("test-sink");
+    dispatcher.register(sink);
+
+    let shutdown = dispatcher.shutdown_handle();
+    let join = tokio::spawn(dispatcher.run());
+
+    // Give the dispatcher and health loop a beat to enter their respective
+    // `notified()` waits. Without this, `notify_one()` could fire before
+    // either has registered, making the test pass for the wrong reason.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    shutdown.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(2), join)
+        .await
+        .expect("dispatcher must drain within 2s of shutdown notify");
+    let inner = result.expect("dispatcher task must not panic");
+    inner.expect("dispatcher run must return Ok on graceful shutdown");
+}
+
 /// Test SinkHealthState serde round-trip.
 #[tokio::test]
 async fn sink_health_state_serde() {
