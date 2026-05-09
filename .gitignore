@@ -55,3 +55,7 @@ perf.data.old
 # OS-specific
 Thumbs.db
 desktop.ini
+
+# Local Claude Code / Codex tooling state (per-checkout, per-developer)
+.claude/
+.codex
