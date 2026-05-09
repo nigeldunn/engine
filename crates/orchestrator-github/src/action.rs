@@ -75,6 +75,15 @@ impl RepoRef {
         validate_repo_name(&self.name)?;
         Ok(())
     }
+
+    /// GitHub treats owner and repo names as case-insensitive ASCII. A
+    /// user-typed `Octo/World` and the API-canonical `octo/world` refer
+    /// to the same repository, so direct string equality drops valid
+    /// merge webhooks. Use this for any "is this the same repo?" check.
+    pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
+        self.owner.eq_ignore_ascii_case(&other.owner)
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -680,6 +689,21 @@ mod tests {
         let p = decode_ensure_branch(&good_payload()).expect("must decode");
         assert_eq!(p.repo.full(), "octo-org/hello-world");
         assert_eq!(p.branch_name, "auto/eng-123/abcdef0123456789");
+    }
+
+    #[test]
+    fn repo_ref_eq_ignore_ascii_case_matches_canonical_variants() {
+        let user_typed = RepoRef { owner: "Octo".into(), name: "World".into() };
+        let api_canonical = RepoRef { owner: "octo".into(), name: "world".into() };
+        let mixed = RepoRef { owner: "OCTO".into(), name: "WoRlD".into() };
+        assert!(user_typed.eq_ignore_ascii_case(&api_canonical));
+        assert!(api_canonical.eq_ignore_ascii_case(&user_typed));
+        assert!(user_typed.eq_ignore_ascii_case(&mixed));
+
+        let different_owner = RepoRef { owner: "evil".into(), name: "world".into() };
+        let different_name = RepoRef { owner: "octo".into(), name: "earth".into() };
+        assert!(!user_typed.eq_ignore_ascii_case(&different_owner));
+        assert!(!user_typed.eq_ignore_ascii_case(&different_name));
     }
 
     #[test]

@@ -270,6 +270,65 @@ fn linear_happy_path_runs_to_merged() {
 }
 
 #[test]
+fn pr_merged_for_wrong_repo_is_ignored() {
+    let r = WorkflowReducer;
+    let mut state = WorkflowState {
+        status: WorkflowStatus::AwaitingHumanApproval,
+        repo: Some(RepoRef { owner: "octo".into(), name: "world".into() }),
+        pr_number: Some(42),
+        ..WorkflowState::default()
+    };
+
+    // Same pr_number, different repo (e.g. a fork or unrelated repo) — must not merge.
+    let wrong_repo = make_envelope(
+        1,
+        EVT_PR_MERGED,
+        json!({
+            "repo": { "owner": "evil", "name": "world" },
+            "pr_number": 42_u64,
+            "merge_commit_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        }),
+    );
+    state = r.reduce(state, &wrong_repo).unwrap();
+    assert_eq!(state.status, WorkflowStatus::AwaitingHumanApproval);
+    assert!(state.merge_commit_sha.is_none());
+
+    // Right repo, wrong pr_number — also ignored.
+    let wrong_pr = make_envelope(
+        2,
+        EVT_PR_MERGED,
+        json!({
+            "repo": { "owner": "octo", "name": "world" },
+            "pr_number": 7_u64,
+            "merge_commit_sha": "feedfacefeedfacefeedfacefeedfacefeedface",
+        }),
+    );
+    state = r.reduce(state, &wrong_pr).unwrap();
+    assert_eq!(state.status, WorkflowStatus::AwaitingHumanApproval);
+    assert!(state.merge_commit_sha.is_none());
+
+    // Matching repo and pr_number — completes. Casing is intentionally
+    // different from the state value (`octo/world`) to assert the
+    // case-insensitive comparison: GitHub normalizes owner/name in API
+    // responses, so user-typed and canonical forms must both route.
+    let ok = make_envelope(
+        3,
+        EVT_PR_MERGED,
+        json!({
+            "repo": { "owner": "Octo", "name": "World" },
+            "pr_number": 42_u64,
+            "merge_commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        }),
+    );
+    state = r.reduce(state, &ok).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Merged);
+    assert_eq!(
+        state.merge_commit_sha.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567"),
+    );
+}
+
+#[test]
 fn triage_rejection_halts_workflow() {
     let r = WorkflowReducer;
     let mut state = WorkflowState::default();

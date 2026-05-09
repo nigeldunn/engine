@@ -589,8 +589,16 @@ fn apply_pr_merged(
         return Ok(());
     }
     let p: PrMerged = decode(&event.payload).map_err(decode_err)?;
-    if state.pr_number != Some(p.pr_number) {
-        // Wrong PR — ignore.
+    // Match (repo, pr_number) so a webhook for a fork or unrelated repo with
+    // a colliding PR number cannot complete this workflow. Repo comparison
+    // is case-insensitive: GitHub normalizes owner/name in API responses,
+    // and a user-typed `Octo/World` must still match the canonical
+    // `octo/world` carried by the webhook payload.
+    let same_repo = state
+        .repo
+        .as_ref()
+        .is_some_and(|r| r.eq_ignore_ascii_case(&p.repo));
+    if !same_repo || state.pr_number != Some(p.pr_number) {
         return Ok(());
     }
     state.merge_commit_sha = Some(p.merge_commit_sha);
