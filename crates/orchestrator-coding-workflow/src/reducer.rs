@@ -259,6 +259,28 @@ fn apply_triage_completed(
     let p: TriageCompleted = decode(&event.payload).map_err(decode_err)?;
     complete_pending(state, &p.action_id);
 
+    if p.indeterminate {
+        // Third outcome: agent couldn't decide. Pause in a non-terminal
+        // status so operators can intervene without the workflow
+        // counting as Failed. We still record FailureInfo so the same
+        // dashboards / state queries that surface failures also see
+        // escalations (the status field disambiguates the two cases).
+        state.status = WorkflowStatus::AwaitingTriageClarification;
+        state.failure = Some(FailureInfo {
+            reason: format!(
+                "triage requested clarification: {}",
+                p.reason.unwrap_or_default(),
+            ),
+            action_id: Some(p.action_id),
+            last_error: None,
+        });
+        // Don't clear pending_action_ids / compensation_depths — there
+        // are no pending actions at this point (we just removed the
+        // triage one above) and we want the maps stable for any future
+        // resume mechanism.
+        return Ok(());
+    }
+
     if !p.accepted {
         halt(
             state,

@@ -358,6 +358,72 @@ fn triage_rejection_halts_workflow() {
 }
 
 #[test]
+fn triage_indeterminate_pauses_in_awaiting_clarification_status() {
+    // Third triage outcome: agent couldn't decide. Workflow pauses in
+    // a non-terminal status (distinct from Failed) so an operator can
+    // intervene without the workflow looking permanently dead.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
+    state = r.reduce(state, &ev0).unwrap();
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+
+    let ev1 = make_envelope(
+        1,
+        EVT_TRIAGE_COMPLETED,
+        json!({
+            "action_id": triage_id.0,
+            "accepted": false,
+            "indeterminate": true,
+            "reason": "is this a bug or a feature request?",
+        }),
+    );
+    state = r.reduce(state, &ev1).unwrap();
+    assert_eq!(state.status, WorkflowStatus::AwaitingTriageClarification);
+    assert!(!state.is_failed(), "indeterminate is NOT a failure");
+    assert!(!state.is_terminal(), "indeterminate is NOT terminal");
+    let info = state.failure.as_ref().expect("FailureInfo carries the question");
+    assert!(info.reason.contains("requested clarification"));
+    assert!(info.reason.contains("is this a bug"));
+
+    // No follow-up action emitted: the workflow waits for an operator,
+    // not for another agent.
+    let actions = r.derive_actions(&state, &ev1).unwrap();
+    assert!(actions.is_empty());
+    // Pending action map is clear (the triage action was completed
+    // before we entered the indeterminate branch).
+    assert!(state.pending_action_ids.is_empty());
+}
+
+#[test]
+fn triage_completed_without_indeterminate_field_still_decodes() {
+    // Backward compat: events written before the `indeterminate` field
+    // existed must continue to deserialize correctly. With
+    // `#[serde(default)]` an absent field defaults to false and the
+    // accepted/rejected branches behave exactly as they did pre-change.
+    let r = WorkflowReducer;
+    let mut state = WorkflowState::default();
+    let ev0 = make_envelope(0, EVT_TICKET_INGESTED, ticket_ingested_payload());
+    state = r.reduce(state, &ev0).unwrap();
+    let triage_id = ActionId::derive(&workflow_id(), 0, 0, KIND_AGENT_TRIAGE);
+
+    // Note: no `indeterminate` field in the payload — simulates an old
+    // event from before the field existed.
+    let ev1 = make_envelope(
+        1,
+        EVT_TRIAGE_COMPLETED,
+        json!({
+            "action_id": triage_id.0,
+            "accepted": true,
+        }),
+    );
+    state = r.reduce(state, &ev1).unwrap();
+    assert_eq!(state.status, WorkflowStatus::Planning);
+    let actions = r.derive_actions(&state, &ev1).unwrap();
+    assert_eq!(actions.len(), 1);
+}
+
+#[test]
 fn empty_plan_halts() {
     let r = WorkflowReducer;
     let mut state = WorkflowState::default();

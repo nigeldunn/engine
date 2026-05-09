@@ -99,6 +99,12 @@ pub enum WorkflowStatus {
     #[default]
     Empty, // no event ingested yet
     Triaging,
+    /// Triage agent returned `indeterminate = true` (cannot decide
+    /// without more info). Workflow is paused; an operator can
+    /// resume it by ingesting clarification or escalating outside the
+    /// engine. Distinct from `Failed` because the ticket is not
+    /// rejected — it's recoverable.
+    AwaitingTriageClarification,
     Planning,
     Architecting, // M11e: optional review of plan before coding starts
     EnsuringBranch,

@@ -59,8 +59,20 @@ pub struct TicketIngested {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TriageCompleted {
     pub action_id: ActionId,
+    /// `true` when the agent decided the ticket is in scope and the
+    /// workflow should proceed to planning. `false` when either the
+    /// ticket is rejected outright OR `indeterminate` is `true`.
     pub accepted: bool,
-    /// `Some(_)` when `accepted == false`.
+    /// `true` when the agent could not decide whether the ticket is in
+    /// scope and is requesting human clarification. The workflow halts
+    /// in `AwaitingTriageClarification` (a non-terminal state distinct
+    /// from outright rejection's `Failed`) so operators can intervene.
+    /// Defaults to `false` so older events (and agents that haven't
+    /// learned the third outcome) deserialize unchanged.
+    #[serde(default)]
+    pub indeterminate: bool,
+    /// Human-readable detail. Populated when `accepted == false` —
+    /// either the rejection reason or the clarification question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
