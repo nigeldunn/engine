@@ -98,22 +98,52 @@ action was claimed and started but the outcome event was never
 written, the dispatcher probes here to find out whether your service
 already did the work.
 
-Response by HTTP status:
+The probe contract is strict (orchestrator-core CLAUDE.md rule #4):
+the dispatcher needs a definitive answer of "the action happened"
+or "the action did NOT happen". Anything else is a **probe failure**
+that costs the action one of its `max_probe_attempts` budget slots.
+Run out, and the action permanently fails with
+`EVT_ACTION_PROBE_EXHAUSTED` — the workflow won't have a chance to
+re-execute it.
 
-| Status | Body | Meaning |
+Response classification:
+
+| Status | Body | Outcome |
 |---|---|---|
-| `200 OK` | `{"status": "running"}` | In flight; dispatcher waits for the next probe interval. |
-| `200 OK` | `{"status": "finished", "output": {...}, "cost_cents": 47}` (or `status` omitted, defaults to finished) | Done; dispatcher writes the outcome event without re-running. |
-| `404 Not Found` | (any) | Never heard of this `action_id`; dispatcher re-runs. |
-
-If you don't have a way to track in-progress action ids, returning
-`404` is acceptable but means the dispatcher will re-execute on crash
-recovery. In that case make sure your `/run` is idempotent (same
-`(action_id, payload)` → same `output`).
+| `200 OK` | `{"status": "finished", "output": {...}, "cost_cents": 47}` (or `status` omitted, defaults to finished) | **Probe success.** Dispatcher writes the outcome event without re-running. Same `output`/`cost_cents` semantics as `/run`. |
+| `404 Not Found` | (any) | **Probe success: definitively no record.** Dispatcher will issue a fresh `/run` on the next claim. |
+| `200 OK` | `{"status": "running"}` | **Probe failure** (`DispatcherError::Sink`). Counts against `max_probe_attempts`. |
+| `200 OK` | missing `output` when finished, unknown `status` string, malformed JSON | **Probe failure** (`MalformedOutput`). Counts against `max_probe_attempts`. |
+| `401`, `403`, `429`, `5xx`, network error, timeout | (any) | **Probe failure** (transport / server error). Counts against `max_probe_attempts`. NOT a sink-unhealthy signal — only `/run` and `/healthz` drive sink health. |
 
 There is **no `{"status": "not_found"}` body shape** — the wire
 signal for "I don't know this action" is HTTP 404, not a JSON status
-string. Returning a 200 without `output` is treated as malformed.
+string.
+
+### When probe budget exhausts
+
+`max_probe_attempts` is `60` for `coder` (sized to accommodate the
+genuinely long runs coders can do), `40` for the other agents. If
+your service keeps returning `200 {"status":"running"}` past that budget,
+the orchestrator emits `EVT_ACTION_PROBE_EXHAUSTED` and the workflow
+treats it as a permanent failure — the failure-compensation logic
+may then emit a fresh action of the same kind (M11f single-shot
+safety net), but a workflow that exhausts compensation halts.
+
+Practical implication: if your `/run` runs synchronously to
+completion (the v1 contract), `/status` should rarely matter — the
+dispatcher only probes when crash recovery happens. If you DO build
+an async-job model where `/run` returns quickly and `/status`
+polls, make sure `/status` either (a) returns `finished` once the
+job completes within the probe budget, or (b) returns `404` so the
+dispatcher re-issues a fresh `/run`.
+
+### Recovery path: returning 404
+
+If you don't have a way to track in-progress action ids, returning
+`404` for any unknown id is the safest answer. The dispatcher will
+re-execute on crash recovery. In that case make sure your `/run` is
+idempotent (same `(action_id, payload)` → same `output`).
 
 ## `GET /healthz`
 
@@ -135,25 +165,63 @@ Other statuses:
 
 ## HTTP status semantics
 
-The orchestrator's classification of your responses to `/run` and
-`/status`:
+The orchestrator's classification depends on which endpoint
+returned the status — `/run` and `/healthz` drive sink health,
+`/status` only drives per-action probe state.
+
+### `POST /run/{type}` outcomes
 
 | Status | Outcome | Notes |
 |---|---|---|
-| `200 OK`, `201 Created` (`/run`) | Body decides — `finished`/omitted → `Succeeded`; `running` → `TransientFail`. | `output` required when finished. |
-| `200 OK` (`/status`) | Body decides as above. | |
-| `404 Not Found` (`/status`) | Treated as "no record"; dispatcher re-runs. | Only `/status` interprets 404 specifically. |
-| `401 Unauthorized` | `SinkUnhealthy { AuthenticationFailed }` — sink stops draining until `/healthz` returns 200. | |
-| `403 Forbidden` | `SinkUnhealthy { PermissionDenied }`. | |
-| `404 Not Found` (`/run`) | `PermanentFail { UnknownAgentType }`. | The agent service doesn't know this `agent_type`. |
-| `422 Unprocessable Entity` (`/run`) | `PermanentFail { InvalidInput }`. | The agent rejected the action's payload. |
-| `429 Too Many Requests` | `TransientFail` — honour any `Retry-After` header. | |
-| `5xx`, network error, timeout | `TransientFail` — automatic retry with backoff up to the action's `max_attempts`. | |
-| Malformed JSON / missing `output` when finished / unknown `status` string | `PermanentFail { MalformedOutput }`. | |
+| `200 OK`, `201 Created` | Body decides — `finished` (or omitted) → `Succeeded`; `running` → `TransientFail`. | `output` required when finished. |
+| `401 Unauthorized` | `SinkUnhealthy { AuthenticationFailed }` — entire agent sink stops draining until `/healthz` returns 200. | |
+| `403 Forbidden` | `SinkUnhealthy { PermissionDenied }` — same. | |
+| `404 Not Found` | `PermanentFail { UnknownAgentType }`. | The agent service doesn't recognize this `agent_type`. |
+| `422 Unprocessable Entity` | `PermanentFail { InvalidInput }`. | The agent rejected the action's payload. |
+| `429 Too Many Requests` | `TransientFail` — honour any `Retry-After`. | |
+| `5xx`, network error, timeout | `TransientFail` — auto-retry up to `max_attempts`. | |
+| Malformed JSON / missing `output` / unknown `status` string | `PermanentFail { MalformedOutput }`. | |
 
-For the agent runner specifically, `coder` actions get a higher retry
-budget (50 attempts × 5min cap) because real coder runs can be long;
-the other agents use 20 attempts.
+### `GET /status/{type}/{action_id}` outcomes
+
+`/status` is governed by the **probe contract** (CLAUDE.md rule #4):
+the dispatcher needs Ok(Some(...)) or Ok(None); anything else is a
+probe failure that consumes the action's `max_probe_attempts`. None
+of the failure variants on this endpoint affect sink health.
+
+| Status | Outcome |
+|---|---|
+| `200 OK`, body `finished` (or omitted), `output` present | Probe success: dispatcher finalizes the prior attempt as Succeeded. |
+| `404 Not Found` | Probe success: definitively no prior attempt; `/run` is re-issued on the next claim. |
+| `200 OK`, body `running` | Probe failure (still working); counts against `max_probe_attempts`. |
+| `200 OK`, body malformed | Probe failure (`MalformedOutput`); counts against `max_probe_attempts`. |
+| `401`, `403`, `429`, `5xx`, network error | Probe failure (transport); counts against `max_probe_attempts`. |
+
+When `max_probe_attempts` exhausts, the action permanently fails with
+`EVT_ACTION_PROBE_EXHAUSTED`.
+
+### `GET /healthz` outcomes
+
+| Status | Health |
+|---|---|
+| `200` | Healthy. |
+| `401` | Unhealthy: `AuthenticationFailed`. |
+| `403` | Unhealthy: `PermissionDenied`. |
+| `5xx`, network error | Unhealthy: `Indeterminate` (transient infra). |
+| Anything else | Unhealthy: `Indeterminate`. |
+
+### Retry budgets
+
+For the agent runner specifically:
+
+| Agent kind | `max_attempts` | `max_probe_attempts` |
+|---|---|---|
+| `coder` | 50 | 60 |
+| All others (triage, planner, architect, reviewer, security_reviewer) | 20 | 40 |
+
+Coder gets a higher budget because real coder runs can be long
+(hours, with backoff). Other agents are bounded to surface stuck
+states sooner.
 
 ## Output schemas
 
