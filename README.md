@@ -2,21 +2,22 @@
 
 A durable, event-sourced workflow engine in Rust. The execution backbone for an autonomous coding system that ingests tickets, runs agents (planner, coder, reviewer, etc.) against them, and produces GitHub PRs for human approval.
 
-This repo is a Cargo workspace of five library crates: the orchestration core, two GitHub I/O crates (outbound action surface + inbound webhook ingestion), the coding workflow reducer, and the agent-runner sink. The actual app binary that wires them together is M13 — see `PLAN.md`.
+This repo is a Cargo workspace of six crates: the orchestration core, two GitHub I/O crates (outbound action surface + inbound webhook ingestion), the coding workflow reducer, the agent-runner sink, and the app binary that wires them together.
 
 ## Status
 
-**v1 contract complete.** All five crates are wired and tested end-to-end at the library level (265 tests workspace-wide; clippy clean). The engine can drive a complete ticket-to-merged-PR cycle in tests with mocked sinks, and against real services once the M13 app binary is built.
+**v1 GitHub-driven coding workflow is end-to-end runnable.** A single `orchestrator-app --config config.toml` boots the engine; `POST /tickets` (or the `ingest` CLI subcommand) starts a workflow; the dispatcher drives it through GitHub + agent service interactions; `pull_request.closed{merged:true}` webhooks complete the cycle. 338 tests pass workspace-wide; clippy clean.
 
 | Crate | What it does |
 |---|---|
 | `orchestrator-core` | Engine: storage, executor, dispatcher, sink trait, sink health, failure events, state-version migration. |
 | `orchestrator-github` | Outbound action surface — 7 GitHub action kinds (ensure_branch, commit_patch, open_pr, update_pr_metadata, set_pr_status, close_pr, post_issue_comment). |
 | `orchestrator-github-webhook` | Inbound webhook ingestion with HMAC-SHA256 validation. Transport-only; consumer's translation closure builds the event. |
-| `orchestrator-coding-workflow` | Pure-function workflow reducer: triage → plan → (optional architecture review) → ensure_branch → code → commit (per task) → review (with iteration loop) → security review → open PR → await human merge. Failure compensation for agent.* actions. |
+| `orchestrator-coding-workflow` | Pure-function workflow reducer: triage → plan → (optional architecture review) → ensure_branch → code → commit (per task) → review (with iteration loop) → security review → open PR → await human merge. Triage `Indeterminate` outcome + failure compensation for agent.* actions. |
 | `orchestrator-agent-runner` | Sink that connects `agent.run_*` actions to an external HTTP agent service implementing a small request/status/health contract. |
+| `orchestrator-app` | The binary that wires everything together: TOML config, dispatcher loop, webhook server, ticket-ingest endpoint + CLI, bounded graceful shutdown. |
 
-**Not yet built**: the app binary (M13). The library crates run a full workflow inside integration tests, but there's no entry point to start one against real GitHub + a real agent service. Designing M13 next — see `PLAN.md`.
+**Operator docs:** [`docs/RUNBOOK.md`](docs/RUNBOOK.md) covers deployment, configuration, GitHub App setup, exit codes, and troubleshooting. [`docs/AGENT_SERVICE.md`](docs/AGENT_SERVICE.md) specifies the HTTP contract your agent service must implement. `PLAN.md` covers history and what's next.
 
 ## What this workspace is
 
@@ -77,6 +78,11 @@ The executor is the only thing that writes events. The dispatcher is the only th
 The five crates compose around this picture:
 
 ```
+                       orchestrator-app
+                      (config + binary)
+                            │
+       ┌────────────────────┼─────────────────────┐
+       ▼                    ▼                     ▼
 orchestrator-coding-workflow                orchestrator-agent-runner
   (pure reducer + event types)                (HTTP client → agent service)
                 │                                            │
@@ -160,15 +166,16 @@ Schema in `crates/orchestrator-core/src/schema.sql`. JSON payloads in TEXT colum
 
 ## What's tested
 
-265 tests workspace-wide. Highlights:
+338 tests workspace-wide. Highlights:
 
 - **Engine** (`crates/orchestrator-core/tests/`) — happy path, ingress dedup, deterministic action IDs, persisted sink health surviving reopens, `SinkUnhealthy` not burning attempts, failure events with crash-safe event-then-state ordering, state-version migration via discard-and-replay, side-event ordering after primary outcomes, `ActionBuilder` round-tripping with `Storage::advance`'s id derivation.
 - **GitHub action surface** (`crates/orchestrator-github/`) — full HTTP-status classification table per action; idempotent execution probes (HTML markers, sha256 footers, branch markers); 422-fallback recovery for partial successes. Plus `#[ignore]`d integration tests gated on real GitHub credentials.
 - **Webhook ingestion** (`crates/orchestrator-github-webhook/`) — HMAC-SHA256 validation over raw bytes, status code mapping (400 / 403 / 422 / 500), router behavior via `tower::ServiceExt::oneshot` (no real network bind).
 - **Coding workflow reducer** (`crates/orchestrator-coding-workflow/tests/`) — linear happy path, multi-task plans, review iteration loops with cap, optional architecture review step, halt paths (triage rejection, security blockers, budget exhaustion, multi-task failure), failure compensation for agent.* actions with per-chain depth tracking.
 - **Agent runner** (`crates/orchestrator-agent-runner/`) — mock `AgentClient` exercises happy/error paths, probe states, health classification, kind routing, request-id propagation, side-event emission for cost.
+- **App binary** (`crates/orchestrator-app/`) — config schema (every reject-case + every accept-case), runtime boot/shutdown (drain timing, abort on grace timeout, partial-boot leak guard), webhook routing (HMAC, 200/401/403/500, race-recovery via in-handler retry), ticket ingest (201/200/409/401/400, override workflow_id, dedup races), end-to-end smoke that drives a full ingest → triage → plan → ensure_branch → code → commit → review → security → open_pr → AwaitingHumanApproval → PrMerged → Merged cycle through the real dispatcher with stub sinks.
 
-The integration tests under `crates/orchestrator-core/tests/end_to_end.rs` are the canonical reference for how to wire the pieces together.
+The integration tests under `crates/orchestrator-core/tests/end_to_end.rs` and `crates/orchestrator-app/tests/end_to_end_smoke.rs` are the canonical reference for how to wire the pieces together.
 
 ## Building and testing
 
@@ -190,14 +197,18 @@ Real-GitHub integration tests are `#[ignore]`d and gated behind environment vari
 
 ## Running end-to-end
 
-The library crates are complete; the app binary that drives them is M13 (see `PLAN.md`). Until then, the integration tests are the way to exercise full flows. To run for real you need:
+```sh
+cargo build --release --bin orchestrator-app
+./target/release/orchestrator-app --config /path/to/orchestrator.toml
+```
 
-1. The M13 app binary (not yet built).
-2. A GitHub App with `pull_request` webhook subscription, contents/PRs/issues write, an Installation, and a PEM private key.
-3. A publicly reachable URL for the webhook endpoint (ngrok / cloudflared / a real deployment).
-4. An agent service implementing the M12 HTTP contract: `POST /run/{type}`, `GET /status/{type}/{id}`, `GET /healthz`, with output JSON matching the schemas in `crates/orchestrator-coding-workflow/src/events.rs`. This is the LLM-backed brain of the system and lives outside this repo.
+You need three external pieces:
 
-`PLAN.md` covers the M13 wiring in more detail.
+1. **A GitHub App** with `pull_request` webhook subscription, contents/PRs/issues write, an Installation, and a PEM private key.
+2. **A publicly reachable URL** for the webhook endpoint (ngrok / cloudflared / a real deployment).
+3. **An agent service** implementing the HTTP contract in [`docs/AGENT_SERVICE.md`](docs/AGENT_SERVICE.md) — this is the LLM-backed brain of the system and lives outside this repo.
+
+Full deployment instructions, configuration reference, exit codes, troubleshooting: [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 ## License
 
@@ -215,5 +226,7 @@ TBD.
 8. `crates/orchestrator-core/tests/end_to_end.rs` — see how it all fits together at the engine layer.
 9. `crates/orchestrator-coding-workflow/src/reducer.rs` — the actual workflow state machine.
 10. `crates/orchestrator-coding-workflow/tests/happy_path.rs` — the workflow's behavior in scenarios.
+11. `crates/orchestrator-app/src/runtime.rs` — how config + sinks + dispatcher boot together; the binary's entry point.
+12. `crates/orchestrator-app/tests/end_to_end_smoke.rs` — the canonical "real dispatcher driving a full happy path" test.
 
-`CLAUDE.md` documents architectural rules that are non-negotiable. `PLAN.md` covers what's next.
+`CLAUDE.md` documents architectural rules that are non-negotiable. `PLAN.md` covers history and what's next. [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`docs/AGENT_SERVICE.md`](docs/AGENT_SERVICE.md) are the operator-facing manuals.
