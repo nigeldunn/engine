@@ -110,6 +110,13 @@ pub async fn resolve_workflow_id_with_retry(
 /// inject controlled probe sequences (alternating Err / Ok(None) /
 /// Ok(Some)) — the real `resolve_workflow_id_from_pr` doesn't expose
 /// hooks for that.
+///
+/// The retry is bounded by **wall-clock** elapsed time, not iteration
+/// count: each `probe()` call runs under `tokio::time::timeout` of the
+/// remaining budget, and the backoff sleep is capped to not push past
+/// the deadline. Without this, a single slow probe (e.g., a DB query
+/// hitting `busy_timeout=5000`) could keep the handler open for tens
+/// of seconds even though the operator configured a tight budget.
 async fn retry_until_resolved<F, Fut>(
     total_budget: Duration,
     backoff: Duration,
@@ -121,23 +128,45 @@ where
 {
     let deadline = Instant::now() + total_budget;
     // Sticky: once we've seen an error, we keep it until either a real
-    // resolution wins (returned immediately above) or the deadline
-    // elapses (in which case we report the error as the conservative
-    // outcome — see function-level docs on resolve_workflow_id_with_retry).
+    // resolution wins (returned immediately) or the deadline elapses
+    // (we report the error as the conservative outcome — see docs on
+    // resolve_workflow_id_with_retry).
     let mut sticky_error: Option<sqlx::Error> = None;
     loop {
-        match probe().await {
-            Ok(Some(id)) => return Ok(Some(id)),
-            Ok(None) => {}
-            Err(e) => sticky_error = Some(e),
-        }
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return match sticky_error {
                 Some(e) => Err(e),
                 None => Ok(None),
             };
         }
-        tokio::time::sleep(backoff).await;
+        match tokio::time::timeout(remaining, probe()).await {
+            Ok(Ok(Some(id))) => return Ok(Some(id)),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => sticky_error = Some(e),
+            Err(_elapsed) => {
+                // Probe didn't finish within the remaining budget.
+                // Treat as a "couldn't tell" outcome (Err) so the
+                // handler returns 500 — silent Ok(None) here would
+                // mask a possibly-tracked merge.
+                let synthetic = sqlx::Error::Protocol(format!(
+                    "workflow lookup exceeded retry budget of {}ms",
+                    total_budget.as_millis(),
+                ));
+                return Err(sticky_error.unwrap_or(synthetic));
+            }
+        }
+        // Cap the backoff so it never pushes us past the deadline —
+        // otherwise a 200ms backoff right before a 100ms-remaining
+        // deadline would silently extend the handler by 100ms.
+        let until_deadline = deadline.saturating_duration_since(Instant::now());
+        if until_deadline.is_zero() {
+            return match sticky_error {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
+        }
+        tokio::time::sleep(backoff.min(until_deadline)).await;
     }
 }
 
@@ -355,6 +384,36 @@ mod tests {
         ]);
         let r = run_retry(probe, Duration::from_millis(50), Duration::from_millis(10)).await;
         assert!(r.is_err(), "got: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn retry_returns_within_budget_even_when_probe_blocks() {
+        // Codex stop-gate round-19 regression: a probe that takes longer
+        // than the budget would previously run to completion before the
+        // deadline check fired, blowing the configured bound. With the
+        // probe wrapped in `tokio::time::timeout(remaining, ...)`, the
+        // helper aborts the slow probe and returns Err immediately at
+        // the deadline.
+        let probe = || async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<Option<WorkflowId>, sqlx::Error>(None)
+        };
+        let started = Instant::now();
+        let result = retry_until_resolved(
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            probe,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "got: {result:?}");
+        // Generous upper bound — slow CI shouldn't flake but the test
+        // still proves the slow probe was aborted (not waited out for
+        // its full 60s sleep).
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "retry took {elapsed:?}; should have aborted near the 50ms budget",
+        );
     }
 
     #[tokio::test]
