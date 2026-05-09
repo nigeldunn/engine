@@ -1,0 +1,56 @@
+[package]
+name = "orchestrator-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "orchestrator-app"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates
+orchestrator-core = { path = "../orchestrator-core" }
+orchestrator-github = { path = "../orchestrator-github" }
+orchestrator-github-webhook = { path = "../orchestrator-github-webhook" }
+orchestrator-coding-workflow = { path = "../orchestrator-coding-workflow" }
+orchestrator-agent-runner = { path = "../orchestrator-agent-runner" }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+
+# HTTP server (for the webhook + ticket-ingest endpoints)
+axum = "0.8"
+
+# SQL access for the (repo, pr_number) -> workflow_id resolver query.
+# Storage exposes its SqlitePool publicly so the app can run app-specific
+# routing queries without leaking schema concerns into orchestrator-core.
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+serde_json = "1"
+
+# Constant-time bearer-token comparison.
+subtle = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config (figment brings its own toml parser via the `toml` feature)
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Errors
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+async-trait = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
