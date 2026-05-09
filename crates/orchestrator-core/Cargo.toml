@@ -28,7 +28,6 @@ thiserror = "2"
 
 # Tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Random for jitter
 rand = "0.8"
@@ -36,3 +35,4 @@ rand = "0.8"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
