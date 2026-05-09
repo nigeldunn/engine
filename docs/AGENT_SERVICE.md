@@ -37,10 +37,13 @@ When no token is configured, the orchestrator sends no auth header.
 
 ## Per-call correlation id
 
-Every request carries an `X-Request-Id` header (UUID v7). Include it
-in your logs and any responses you return for cross-system tracing.
-The orchestrator stamps the same id onto the resulting outcome
-event's `trace_id` field.
+Each `POST /run` carries an `X-Request-Id` header (UUID v7, prefixed
+`req_`). Include it in your logs for cross-system tracing — the
+orchestrator stamps the same id onto the resulting outcome event's
+`trace_id` field.
+
+`GET /status` and `GET /healthz` do NOT carry the header (status is
+keyed off `action_id`; healthz is unattributed).
 
 ## `POST /run/{agent_type}`
 
@@ -53,22 +56,31 @@ Request body:
 }
 ```
 
-Successful response (the agent finished):
+Headers: `Content-Type: application/json`, `X-Request-Id: <uuid>`,
+optional `Authorization: Bearer <token>`.
+
+Successful response — `200 OK` or `201 Created`, same body shape:
 
 ```json
 {
-  "status": "finished",
-  "output": { /* must match the schema for this agent_type */ },
-  "cost_cents": 47       // optional, in fixed-point USD cents
+  "status": "finished",            // OPTIONAL; default "finished" when omitted
+  "output": { /* must match the output schema for this agent_type */ },
+  "cost_cents": 47                 // OPTIONAL, fixed-point USD cents
 }
 ```
 
-Still-running response (only valid for crash-recovery scenarios; v1
-expects synchronous-finish from `/run`):
+Still-running response (the v1 contract expects `/run` to block until
+finished, but the client tolerates this for protocol-violation
+recovery):
 
 ```json
-{ "status": "still_running" }
+{ "status": "running" }
 ```
+
+When the body's `status` is `"running"` the action is treated as
+`TransientFail` — the dispatcher retries after backoff. When `status`
+is `"finished"` (or omitted), `output` is required; missing `output`
+is a `PermanentFail` (malformed response).
 
 `output` is an opaque JSON value the orchestrator deserializes into a
 typed event. The exact schema depends on `agent_type` — see [Output
@@ -76,8 +88,8 @@ schemas](#output-schemas).
 
 `cost_cents` is optional. When present, the orchestrator emits a
 `core.budget.consumed.v1` side event so per-workflow cost caps can be
-enforced. Use **fixed-point USD cents** (integer) — float accumulation
-breaks deterministic replay.
+enforced. Use **fixed-point USD cents** (integer) — float
+accumulation breaks deterministic replay.
 
 ## `GET /status/{agent_type}/{action_id}`
 
@@ -86,49 +98,58 @@ action was claimed and started but the outcome event was never
 written, the dispatcher probes here to find out whether your service
 already did the work.
 
-Response shapes:
+Response by HTTP status:
 
-```json
-// Never heard of this action_id. Dispatcher re-runs.
-{ "status": "not_found" }
-
-// Still running. Dispatcher waits for the next probe interval.
-{ "status": "running" }
-
-// Already finished. Same shape as /run's "finished" response.
-{ "status": "finished", "output": { ... }, "cost_cents": 47 }
-```
+| Status | Body | Meaning |
+|---|---|---|
+| `200 OK` | `{"status": "running"}` | In flight; dispatcher waits for the next probe interval. |
+| `200 OK` | `{"status": "finished", "output": {...}, "cost_cents": 47}` (or `status` omitted, defaults to finished) | Done; dispatcher writes the outcome event without re-running. |
+| `404 Not Found` | (any) | Never heard of this `action_id`; dispatcher re-runs. |
 
 If you don't have a way to track in-progress action ids, returning
-`not_found` is acceptable but means the dispatcher will re-execute on
-crash recovery. In that case make sure your `/run` is idempotent
-(produces the same output for the same action_id).
+`404` is acceptable but means the dispatcher will re-execute on crash
+recovery. In that case make sure your `/run` is idempotent (same
+`(action_id, payload)` → same `output`).
+
+There is **no `{"status": "not_found"}` body shape** — the wire
+signal for "I don't know this action" is HTTP 404, not a JSON status
+string. Returning a 200 without `output` is treated as malformed.
 
 ## `GET /healthz`
 
 Dispatcher's sink-health loop calls this when the agent sink is
 considered unhealthy, on the configured `health_check_interval_ms`.
 
-Response: any 2xx → healthy. Anything else → unhealthy (the
-dispatcher distinguishes 401 → AuthenticationFailed from 5xx →
-Indeterminate, etc., per the standard HTTP-class table).
+Response: **HTTP 200 specifically → healthy** (not generic 2xx). Body
+is ignored; keep it cheap — this fires regularly.
 
-Body is ignored. Keep it cheap — this fires regularly.
+Other statuses:
+
+| Status | Health outcome |
+|---|---|
+| `200` | Healthy. |
+| `401` | Unhealthy: `AuthenticationFailed`. |
+| `403` | Unhealthy: `PermissionDenied`. |
+| `5xx` | Unhealthy: `Indeterminate` (transient infrastructure). |
+| Anything else | Unhealthy: `Indeterminate` (treated as transport error). |
 
 ## HTTP status semantics
 
-The orchestrator's classification of your responses:
+The orchestrator's classification of your responses to `/run` and
+`/status`:
 
-| Status | Meaning to the orchestrator |
-|---|---|
-| `200 OK` (`/run`, `/status`) | Use the body to determine outcome. |
-| `2xx` (`/healthz`) | Healthy. |
-| `400 Bad Request` | `PermanentFail` — the action will not be retried. Use this for invariant-breaking inputs. |
-| `401 Unauthorized` | `SinkUnhealthy { AuthenticationFailed }`. Sink stops draining until the health loop sees a 200 from `/healthz`. |
-| `403 Forbidden` | `SinkUnhealthy { PermissionDenied }`. |
-| `404 Not Found` (`/status`) | Treated as `{"status": "not_found"}`. |
-| `429 Too Many Requests` | `TransientFail` — honour any `Retry-After` header. |
-| `5xx`, network error, timeout | `TransientFail` — automatic retry with backoff up to the action's `max_attempts`. |
+| Status | Outcome | Notes |
+|---|---|---|
+| `200 OK`, `201 Created` (`/run`) | Body decides — `finished`/omitted → `Succeeded`; `running` → `TransientFail`. | `output` required when finished. |
+| `200 OK` (`/status`) | Body decides as above. | |
+| `404 Not Found` (`/status`) | Treated as "no record"; dispatcher re-runs. | Only `/status` interprets 404 specifically. |
+| `401 Unauthorized` | `SinkUnhealthy { AuthenticationFailed }` — sink stops draining until `/healthz` returns 200. | |
+| `403 Forbidden` | `SinkUnhealthy { PermissionDenied }`. | |
+| `404 Not Found` (`/run`) | `PermanentFail { UnknownAgentType }`. | The agent service doesn't know this `agent_type`. |
+| `422 Unprocessable Entity` (`/run`) | `PermanentFail { InvalidInput }`. | The agent rejected the action's payload. |
+| `429 Too Many Requests` | `TransientFail` — honour any `Retry-After` header. | |
+| `5xx`, network error, timeout | `TransientFail` — automatic retry with backoff up to the action's `max_attempts`. | |
+| Malformed JSON / missing `output` when finished / unknown `status` string | `PermanentFail { MalformedOutput }`. | |
 
 For the agent runner specifically, `coder` actions get a higher retry
 budget (50 attempts × 5min cap) because real coder runs can be long;
@@ -323,7 +344,9 @@ What `payload` you'll see in `POST /run/{agent_type}` requests.
 ```json
 {
   "ticket": {"source": "manual", "id": "ENG-123"},
-  "repo": {"owner": "octo", "name": "world"}
+  "repo": {"owner": "octo", "name": "world"},
+  "branch": "auto/eng-123/abcdef0123456789",
+  "head_sha": "abcdef0123456789abcdef0123456789abcdef01"
 }
 ```
 
@@ -332,7 +355,9 @@ What `payload` you'll see in `POST /run/{agent_type}` requests.
 ```json
 {
   "ticket": {"source": "manual", "id": "ENG-123"},
-  "repo": {"owner": "octo", "name": "world"}
+  "repo": {"owner": "octo", "name": "world"},
+  "branch": "auto/eng-123/abcdef0123456789",
+  "head_sha": "abcdef0123456789abcdef0123456789abcdef01"
 }
 ```
 
