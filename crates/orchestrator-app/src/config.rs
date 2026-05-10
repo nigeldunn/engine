@@ -65,21 +65,10 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    pub sqlite_path: PathBuf,
-}
-
-impl StorageConfig {
-    /// Resolve `sqlite_path` against `base_dir` if it is relative.
-    /// Same rationale as `Secret::resolve`: a relative path in TOML
-    /// should refer to a sibling of the config file, not whatever
-    /// directory the binary happened to be launched from.
-    pub fn resolved_sqlite_path(&self, base_dir: &Path) -> PathBuf {
-        if self.sqlite_path.is_absolute() {
-            self.sqlite_path.clone()
-        } else {
-            base_dir.join(&self.sqlite_path)
-        }
-    }
+    /// Postgres connection URL, e.g. `postgres://orch:orch@localhost:5432/orch`.
+    /// Override at deploy time via `ORCH_STORAGE__DATABASE_URL` so the
+    /// password never needs to live in the config file.
+    pub database_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,7 +232,7 @@ impl std::ops::Deref for LoadedConfig {
 impl Config {
     /// Load the config from a TOML file with environment overrides.
     /// Env vars use the prefix `ORCH_` and `__` as section separator,
-    /// e.g. `ORCH_STORAGE__SQLITE_PATH=/var/lib/orch/db.sqlite`.
+    /// e.g. `ORCH_STORAGE__DATABASE_URL=postgres://...`.
     /// Returns a [`LoadedConfig`] that carries the directory used to
     /// resolve relative secret / sqlite paths.
     pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
@@ -381,7 +370,7 @@ mod tests {
         // covered by their own tests with tempfiles.
         r#"
 [storage]
-sqlite_path = "/tmp/orch.sqlite"
+database_url = "postgres://orch:orch@localhost:5432/orch"
 
 [github]
 app_id = 12345
@@ -410,26 +399,15 @@ unhealthy_retry_interval_ms = 5000
     fn loads_full_config_with_default_webhook_path_prefix() {
         let f = write_tmp_toml(&full_config_toml());
         let cfg = Config::load(f.path()).expect("must load");
-        assert_eq!(cfg.storage.sqlite_path.to_str(), Some("/tmp/orch.sqlite"));
+        assert_eq!(
+            cfg.storage.database_url,
+            "postgres://orch:orch@localhost:5432/orch"
+        );
         assert_eq!(cfg.github.app_id, 12345);
         assert_eq!(cfg.server.webhook.path_prefix, "/webhook");
         assert!(cfg.agent_runner.bearer_token.is_none());
     }
 
-    #[test]
-    fn relative_sqlite_path_resolves_against_config_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = full_config_toml().replace(
-            r#"sqlite_path = "/tmp/orch.sqlite""#,
-            r#"sqlite_path = "data/orch.sqlite""#,
-        );
-        let config_path = dir.path().join("orch.toml");
-        std::fs::write(&config_path, toml).unwrap();
-
-        let cfg = Config::load(&config_path).unwrap();
-        let resolved = cfg.storage.resolved_sqlite_path(dir.path());
-        assert_eq!(resolved, dir.path().join("data/orch.sqlite"));
-    }
 
     #[test]
     fn invalid_path_prefix_is_rejected_at_validate() {
@@ -516,16 +494,6 @@ unhealthy_retry_interval_ms = 5000
         }
     }
 
-    #[test]
-    fn absolute_sqlite_path_is_unchanged_by_resolve() {
-        let cfg = StorageConfig {
-            sqlite_path: PathBuf::from("/var/lib/orch/db.sqlite"),
-        };
-        assert_eq!(
-            cfg.resolved_sqlite_path(Path::new("/anywhere/else")),
-            PathBuf::from("/var/lib/orch/db.sqlite"),
-        );
-    }
 
     #[test]
     fn secret_inline_resolves_directly() {

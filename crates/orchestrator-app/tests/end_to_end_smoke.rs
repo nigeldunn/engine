@@ -29,7 +29,7 @@ use orchestrator_coding_workflow::{
 use orchestrator_core::{
     ActionId, AttemptOutcome, Causation, ClaimedAction, Dispatcher,
     DispatcherConfig as CoreDispatcherConfig, DispatcherError, EventCommand, Executor, Sink,
-    Storage, WorkflowId,
+    WorkflowId,
 };
 use orchestrator_github::{
     branch_ensured_event, commit_pushed_event, decode_commit_patch, decode_ensure_branch,
@@ -180,24 +180,17 @@ impl Sink for StubGithubSink {
 // ── helpers ────────────────────────────────────────────────────────────
 
 /// Read the cached workflow state directly from the snapshots table.
-/// We bypass any public Storage API because there isn't one — the
-/// snapshot is an internal cache. For the smoke test asserting the
-/// final reducer outcome (status, merge_commit_sha) is the whole point;
-/// without this read we'd only be observing event-presence in the log,
-/// which can't distinguish "reducer transitioned" from "reducer
-/// silently ignored the event".
+/// Snapshots have no production read path (they're an internal cache),
+/// but tests use them as a deterministic observable for reducer outcomes
+/// (status, merge_commit_sha) that aren't visible from the event log
+/// alone. The privileged read lives in `orchestrator_core::test_support`.
 async fn read_workflow_state(
     executor: &Executor<WorkflowReducer>,
     workflow_id: &WorkflowId,
 ) -> Option<WorkflowState> {
-    use sqlx::Row;
-    let row = sqlx::query("SELECT state_blob FROM snapshots WHERE workflow_id = ?")
-        .bind(workflow_id.as_str())
-        .fetch_optional(executor.storage().pool())
-        .await
-        .expect("snapshot query failed")?;
-    let blob: String = row.try_get("state_blob").expect("state_blob column");
-    let value: serde_json::Value = serde_json::from_str(&blob).expect("state JSON parse");
+    let value =
+        orchestrator_core::test_support::read_snapshot_state(executor.storage(), workflow_id)
+            .await?;
     Some(serde_json::from_value(value).expect("state schema match"))
 }
 
@@ -240,7 +233,7 @@ async fn poll_until_event(
 async fn happy_path_drives_through_to_merged() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = orchestrator_core::test_support::fresh_storage().await;
     let executor = Arc::new(Executor::new(storage, WorkflowReducer));
 
     let mut dispatcher = Dispatcher::new(

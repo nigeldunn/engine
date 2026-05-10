@@ -157,16 +157,15 @@ impl Runtime {
     /// Boot the engine end-to-end: storage + sinks + dispatcher + webhook
     /// HTTP server. Both subsystems are running by the time this returns.
     /// The `LoadedConfig` carries the validated base directory so secret
-    /// and sqlite paths resolve consistently across callers.
+    /// paths resolve consistently across callers.
     #[instrument(skip(cfg), fields(install_id = cfg.github.install_id))]
     pub async fn boot(cfg: &LoadedConfig) -> Result<Self, RuntimeError> {
         let base_dir = cfg.base_dir();
-        // Storage. Relative sqlite_path resolves against the config dir
-        // so a relative `data/orch.sqlite` lands beside the config file.
-        let sqlite_path = cfg.storage.resolved_sqlite_path(base_dir);
-        let database_url = format!("sqlite:{}", sqlite_path.display());
-        info!(%database_url, "opening storage");
-        let storage = Storage::open(&database_url).await?;
+        // Storage. The Postgres connection URL comes straight from config;
+        // production deployments override via ORCH_STORAGE__DATABASE_URL
+        // so credentials never live in the TOML file or container image.
+        info!("opening storage");
+        let storage = Storage::open(&cfg.storage.database_url).await?;
 
         // Executor wraps storage + the workflow reducer.
         let executor = Arc::new(Executor::new(storage, WorkflowReducer));

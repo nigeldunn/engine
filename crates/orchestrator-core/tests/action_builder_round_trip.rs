@@ -1,6 +1,7 @@
 //! Integration test: ActionBuilder ids must byte-match what Storage::advance
 //! derives when it iterates the returned Vec<Action>.
 
+use orchestrator_core::test_support::fresh_storage;
 use orchestrator_core::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -61,7 +62,7 @@ impl Reducer for MultiActionReducer {
 
 #[tokio::test]
 async fn action_builder_ids_match_storage_advance_indices() {
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
     let executor = Executor::new(storage, MultiActionReducer);
 
     let wf = WorkflowId::new("wf-builder");
@@ -162,9 +163,9 @@ async fn changing_only_kind_changes_the_persisted_id() {
         }
     }
 
-    let storage_a = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage_a, _db_a) = fresh_storage().await;
     let exec_a = Executor::new(storage_a, SingleKind("kind.x"));
-    let storage_b = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage_b, _db_b) = fresh_storage().await;
     let exec_b = Executor::new(storage_b, SingleKind("kind.y"));
 
     let wf = WorkflowId::new("wf-kind");

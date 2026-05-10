@@ -1,0 +1,25 @@
+[storage]
+# Postgres connection URL. In production, set this via the
+# `ORCH_STORAGE__DATABASE_URL` env var (populated from a secret store)
+# so the password never lives in the config file or container image.
+database_url = "postgres://orch:orch@localhost:5432/orch"
+
+[github]
+app_id = 12345
+install_id = 67890
+private_key = { path = "/etc/orchestrator/github-app.pem" }
+webhook_secret = { path = "/etc/orchestrator/webhook-secret" }
+
+[agent_runner]
+base_url = "http://agent-svc.internal:8080"
+
+[server.webhook]
+listen = "0.0.0.0:8080"
+
+[server.ingest]
+# Defaults to 127.0.0.1:8081. Set non-loopback only with bearer_token.
+
+[dispatcher]
+poll_interval_ms = 250
+health_check_interval_ms = 30000
+unhealthy_retry_interval_ms = 5000

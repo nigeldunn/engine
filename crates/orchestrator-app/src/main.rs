@@ -142,14 +142,12 @@ async fn run_engine(cfg: LoadedConfig) -> ExitCode {
 
 async fn run_ingest_subcommand(cfg: LoadedConfig, args: IngestArgs) -> ExitCode {
     // Open Storage directly — no Dispatcher / sinks. Concurrent with a
-    // running engine instance is safe (SQLite WAL handles the writer
-    // contention; Storage::advance is transactional).
-    let sqlite_path = cfg.storage.resolved_sqlite_path(cfg.base_dir());
-    let database_url = format!("sqlite:{}", sqlite_path.display());
-    let storage = match Storage::open(&database_url).await {
+    // running engine instance is safe: `Storage::advance` is transactional
+    // and Postgres serialises any contention through the per-row locks.
+    let storage = match Storage::open(&cfg.storage.database_url).await {
         Ok(s) => s,
         Err(err) => {
-            tracing::error!(%err, %database_url, "storage open failed");
+            tracing::error!(%err, "storage open failed");
             return ExitCode::from(1);
         }
     };

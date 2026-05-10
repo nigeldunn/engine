@@ -34,7 +34,6 @@ use orchestrator_coding_workflow::{
 };
 use orchestrator_core::{AdvanceOutcome, Causation, EventCommand, Executor, Storage, WorkflowId};
 use serde::Deserialize;
-use sqlx::Row;
 use tracing::{debug, instrument, warn};
 
 /// HTTP request body for `POST /tickets`. The TicketIngested fields
@@ -245,44 +244,26 @@ fn classify_against_stored(
 }
 
 /// Look up the prior `TicketIngested` event for `dedup_key` and return
-/// its payload if present. The caller compares against the new payload
-/// to distinguish idempotent re-posts (matching) from configuration
-/// drift (mismatch → 409).
+/// its payload if present. Thin wrapper over `Storage::find_prior_ticket_payload`
+/// so the call site reads naturally inside the ingest pipeline.
 async fn check_dedup_conflict(
     storage: &Storage,
     dedup_key: &str,
 ) -> Result<Option<serde_json::Value>, sqlx::Error> {
-    let row = sqlx::query(
-        r#"
-        SELECT payload FROM events
-        WHERE ingress_dedup_key = ?
-          AND payload_type = 'workflow.ticket_ingested.v1'
-        LIMIT 1
-        "#,
-    )
-    .bind(dedup_key)
-    .fetch_optional(storage.pool())
-    .await?;
-
-    let Some(r) = row else {
-        return Ok(None);
-    };
-    let stored_text: String = r.try_get("payload")?;
-    let stored = serde_json::from_str(&stored_text)
-        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-    Ok(Some(stored))
+    storage.find_prior_ticket_payload(dedup_key).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use orchestrator_coding_workflow::events::{TicketIngested, TicketRef};
+    use orchestrator_core::test_support::{fresh_storage, DbGuard};
     use orchestrator_core::Executor;
     use orchestrator_github::RepoRef;
 
-    async fn fixture() -> Arc<Executor<WorkflowReducer>> {
-        let storage = Storage::open("sqlite::memory:").await.unwrap();
-        Arc::new(Executor::new(storage, WorkflowReducer))
+    async fn fixture() -> (Arc<Executor<WorkflowReducer>>, DbGuard) {
+        let (storage, db) = fresh_storage().await;
+        (Arc::new(Executor::new(storage, WorkflowReducer)), db)
     }
 
     fn sample_ticket() -> TicketIngested {
@@ -304,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_ingest_writes_event_and_derives_workflow_id_from_ticket() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let outcome = ingest_ticket(
             &exec,
             IngestRequest {
@@ -331,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn re_ingest_with_identical_payload_is_idempotent() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let req = || IngestRequest {
             workflow_id: None,
             ticket_ingested: sample_ticket(),
@@ -354,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn re_ingest_with_conflicting_payload_returns_conflict() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let _ = ingest_ticket(
             &exec,
             IngestRequest {
@@ -391,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_workflow_id_override_decouples_from_ticket_id() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let outcome = ingest_ticket(
             &exec,
             IngestRequest {
@@ -462,7 +443,7 @@ mod tests {
         // phases separately and sneak a competing write in between —
         // the race-loser's `executor.advance` then trips
         // `deduplicated = true` and our classifier runs.
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
 
         // Phase 1 of request B (the future race-loser): preflight
         // returns None because the events table is still empty.
@@ -517,7 +498,7 @@ mod tests {
         // Same setup as above but the race winner's payload matches
         // ours — so the classifier returns AlreadyExists rather than
         // Conflict. Proves both arms of the post-dedup branch.
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let req = || IngestRequest {
             workflow_id: None,
             ticket_ingested: sample_ticket(),
@@ -545,8 +526,8 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_failure_propagates_when_pool_is_closed() {
-        let exec = fixture().await;
-        exec.storage().pool().close().await;
+        let (exec, _db) = fixture().await;
+        exec.storage().close().await;
         let err = ingest_ticket(
             &exec,
             IngestRequest {

@@ -5,6 +5,7 @@
 //! `advance` discards the snapshot and replays the event log to rebuild
 //! state. Snapshots are a cache; the event log is authoritative.
 
+use orchestrator_core::test_support::{fresh_storage, reopen};
 use orchestrator_core::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -47,7 +48,7 @@ impl Reducer for VersionedReducer {
 
 #[tokio::test]
 async fn matching_state_version_reuses_snapshot() {
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
     let executor = Executor::new(storage, VersionedReducer { version: 1 });
 
     let workflow_id = WorkflowId::new("wf-match");
@@ -92,17 +93,13 @@ async fn matching_state_version_reuses_snapshot() {
 
 #[tokio::test]
 async fn state_version_mismatch_discards_snapshot_and_replays() {
-    use tempfile::TempDir;
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("test.db");
-    let url = format!("sqlite://{}", db_path.display());
+    let (storage, db) = fresh_storage().await;
 
     let workflow_id = WorkflowId::new("wf-migrate");
 
     // Phase 1: write 4 events with reducer at version 1. Snapshot
     // persists at state_version=1.
     {
-        let storage = Storage::open(&url).await.unwrap();
         let executor = Executor::new(storage, VersionedReducer { version: 1 });
         for i in 0..4 {
             executor
@@ -123,11 +120,11 @@ async fn state_version_mismatch_discards_snapshot_and_replays() {
         }
     }
 
-    // Phase 2: reopen with reducer at version 2 (simulating a schema
-    // bump). The next advance must discard the v1 snapshot and replay
-    // the 4 stored events to rebuild state to count=4 before applying
-    // the new event.
-    let storage = Storage::open(&url).await.unwrap();
+    // Phase 2: reopen against the same per-test database with reducer
+    // at version 2 (simulating a schema bump). The next advance must
+    // discard the v1 snapshot and replay the 4 stored events to rebuild
+    // state to count=4 before applying the new event.
+    let storage = reopen(&db).await;
     let executor = Executor::new(storage, VersionedReducer { version: 2 });
     let outcome = executor
         .advance(EventCommand {

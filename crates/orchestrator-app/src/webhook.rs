@@ -19,8 +19,7 @@ use std::time::{Duration, Instant};
 use orchestrator_coding_workflow::{translate_github_webhook, WorkflowReducer};
 use orchestrator_core::{Executor, Storage, WorkflowId};
 use orchestrator_github_webhook::GithubWebhookDelivery;
-use sqlx::Row;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 /// Find the `WorkflowId` whose stored `github.pr_opened.v1` event
 /// matches `(owner, name, pr_number)`. Owner and name are compared
@@ -43,36 +42,11 @@ pub async fn resolve_workflow_id_from_pr(
     name: &str,
     pr_number: u64,
 ) -> Result<Option<WorkflowId>, sqlx::Error> {
-    let row = sqlx::query(
-        r#"
-        SELECT workflow_id FROM events
-        WHERE payload_type = 'github.pr_opened.v1'
-          AND json_extract(payload, '$.repo.owner') = ? COLLATE NOCASE
-          AND json_extract(payload, '$.repo.name')  = ? COLLATE NOCASE
-          AND json_extract(payload, '$.pr_number')  = ?
-        ORDER BY recorded_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(owner)
-    .bind(name)
-    .bind(pr_number as i64)
-    .fetch_optional(storage.pool())
-    .await?;
-
-    let Some(r) = row else {
-        debug!("no PrOpened event for (owner, name, pr_number)");
-        return Ok(None);
-    };
-
-    match r.try_get::<String, _>("workflow_id") {
-        Ok(id) => Ok(Some(WorkflowId::new(id))),
-        Err(e) => {
-            // Column decode failures indicate schema corruption — surface
-            // as a lookup error (transient bucket; an operator will see
-            // the 500 and dig in).
-            warn!(error = %e, "workflow_id column decode failed");
-            Err(e)
+    match storage.find_pr_workflow_id(owner, name, pr_number).await? {
+        Some(id) => Ok(Some(id)),
+        None => {
+            debug!("no PrOpened event for (owner, name, pr_number)");
+            Ok(None)
         }
     }
 }
@@ -289,12 +263,13 @@ pub async fn handle_delivery_with_budget(
 mod tests {
     use super::*;
     use orchestrator_coding_workflow::WorkflowReducer;
+    use orchestrator_core::test_support::{fresh_storage, DbGuard};
     use orchestrator_core::Executor;
     use serde_json::json;
 
-    async fn fixture() -> Arc<Executor<WorkflowReducer>> {
-        let storage = Storage::open("sqlite::memory:").await.unwrap();
-        Arc::new(Executor::new(storage, WorkflowReducer))
+    async fn fixture() -> (Arc<Executor<WorkflowReducer>>, DbGuard) {
+        let (storage, db) = fresh_storage().await;
+        (Arc::new(Executor::new(storage, WorkflowReducer)), db)
     }
 
     /// A scripted probe that returns a pre-recorded sequence of
@@ -432,46 +407,11 @@ mod tests {
         assert_eq!(r.as_str(), "wf-recovered");
     }
 
-    /// Insert a synthetic PrOpened event directly into the events
-    /// table. Bypasses the reducer (which would reject the event
-    /// without prior workflow state); fine for testing the resolver
-    /// query in isolation.
-    async fn insert_pr_opened(
-        storage: &Storage,
-        workflow_id: &str,
-        owner: &str,
-        name: &str,
-        pr_number: u64,
-    ) {
-        let payload = json!({
-            "action_id": "test-action",
-            "repo": { "owner": owner, "name": name },
-            "pr_number": pr_number,
-            "html_url": format!("https://github.com/{owner}/{name}/pull/{pr_number}"),
-            "state": "open",
-        });
-        sqlx::query(
-            r#"
-            INSERT INTO events (
-                workflow_id, sequence, event_id, recorded_at,
-                payload_type, payload_schema_version,
-                causation_kind, causation_ref, payload, ingress_dedup_key
-            ) VALUES (?, ?, ?, ?, 'github.pr_opened.v1', 1, 'system', NULL, ?, NULL)
-            "#,
-        )
-        .bind(workflow_id)
-        .bind(0_i64)
-        .bind(format!("ev-{workflow_id}-{pr_number}"))
-        .bind("2026-01-01T00:00:00Z")
-        .bind(payload.to_string())
-        .execute(storage.pool())
-        .await
-        .unwrap();
-    }
+    use orchestrator_core::test_support::insert_pr_opened_event as insert_pr_opened;
 
     #[tokio::test]
     async fn returns_workflow_id_for_matching_pr() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         insert_pr_opened(exec.storage(), "wf-1", "octo", "world", 42).await;
         let id = resolve_workflow_id_from_pr(exec.storage(), "octo", "world", 42)
             .await
@@ -482,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn matches_repo_owner_and_name_case_insensitively() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         insert_pr_opened(exec.storage(), "wf-1", "octo", "world", 42).await;
         let id = resolve_workflow_id_from_pr(exec.storage(), "Octo", "World", 42)
             .await
@@ -493,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_ok_none_for_different_repo() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         insert_pr_opened(exec.storage(), "wf-1", "octo", "world", 42).await;
         assert!(matches!(
             resolve_workflow_id_from_pr(exec.storage(), "evil", "world", 42).await,
@@ -503,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_ok_none_for_different_pr_number() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         insert_pr_opened(exec.storage(), "wf-1", "octo", "world", 42).await;
         assert!(matches!(
             resolve_workflow_id_from_pr(exec.storage(), "octo", "world", 7).await,
@@ -513,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_ok_none_when_no_pr_opened_event_exists() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         assert!(matches!(
             resolve_workflow_id_from_pr(exec.storage(), "octo", "world", 42).await,
             Ok(None)
@@ -526,8 +466,8 @@ mod tests {
         // restart, connection limit, etc.). The resolver MUST propagate
         // the error so the webhook handler returns 500 and GitHub
         // retries — silently mapping it to None would drop a real merge.
-        let exec = fixture().await;
-        exec.storage().pool().close().await;
+        let (exec, _db) = fixture().await;
+        exec.storage().close().await;
         let result = resolve_workflow_id_from_pr(exec.storage(), "octo", "world", 42).await;
         assert!(result.is_err(), "got: {result:?}");
     }
@@ -553,12 +493,15 @@ mod tests {
     }
 
     /// Tight budget so tests don't wait 5 production seconds.
-    const TEST_BUDGET: Duration = Duration::from_millis(50);
-    const TEST_BACKOFF: Duration = Duration::from_millis(10);
+    /// Budget chosen to comfortably exceed Postgres connection-acquire +
+    /// first-query overhead on a fresh per-test database (~50–100ms in
+    /// practice) while still keeping the test fast.
+    const TEST_BUDGET: Duration = Duration::from_millis(500);
+    const TEST_BACKOFF: Duration = Duration::from_millis(20);
 
     #[tokio::test]
     async fn handle_delivery_advances_workflow_for_resolved_pr() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         insert_pr_opened(exec.storage(), "wf-1", "octo", "world", 42).await;
 
         let delivery = pr_merged_delivery("delivery-test-1", "octo", "world", 42);
@@ -591,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_delivery_returns_unresolved_for_unknown_pr_after_retry_budget() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let delivery = pr_merged_delivery("d2", "nobody", "noproject", 999);
         let started = Instant::now();
         let err = handle_delivery_with_budget(&exec, &delivery, TEST_BUDGET, TEST_BACKOFF)
@@ -618,7 +561,7 @@ mod tests {
         // open-then-merge race. We spawn the handler with a generous
         // budget and concurrently insert PrOpened after a short delay;
         // the handler should resolve mid-flight and advance.
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let delivery = pr_merged_delivery("d-race", "octo", "world", 42);
 
         let exec_inserter = exec.clone();
@@ -647,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_delivery_ignores_pull_request_closed_without_merge() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         insert_pr_opened(exec.storage(), "wf-1", "octo", "world", 42).await;
 
         let delivery = GithubWebhookDelivery {
@@ -668,8 +611,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_delivery_surfaces_lookup_failure_when_pool_is_closed() {
-        let exec = fixture().await;
-        exec.storage().pool().close().await;
+        let (exec, _db) = fixture().await;
+        exec.storage().close().await;
         let delivery = pr_merged_delivery("d-lookup-err", "octo", "world", 42);
         let err = handle_delivery_with_budget(&exec, &delivery, TEST_BUDGET, TEST_BACKOFF)
             .await
@@ -682,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_delivery_ignores_unrelated_event_types() {
-        let exec = fixture().await;
+        let (exec, _db) = fixture().await;
         let delivery = GithubWebhookDelivery {
             event_type: "issue_comment".into(),
             delivery_id: "d4".into(),

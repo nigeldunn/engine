@@ -3,8 +3,8 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::Value as Json;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool, Transaction};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, instrument};
@@ -19,33 +19,124 @@ use crate::health::{
 use crate::ids::{ActionId, DispatcherId, EventId, WorkflowId};
 use crate::reducer::{state_from_json, state_to_json, Reducer};
 
-const SCHEMA_SQL: &str = include_str!("schema.sql");
-
 #[derive(Clone)]
 pub struct Storage {
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
 impl Storage {
+    /// Open a connection pool against `database_url` and run the embedded
+    /// migrations. Pool is tuned for Aurora Serverless: small max connections,
+    /// no minimum, idle timeout to release connections so the DB can pause,
+    /// and a generous acquire timeout to tolerate cold-resume latency.
     pub async fn open(database_url: &str) -> Result<Self, ExecutorError> {
-        let opts = SqliteConnectOptions::from_str(database_url)
-            .map_err(|e| ExecutorError::Internal(e.to_string()))?
-            .create_if_missing(true)
-            .pragma("journal_mode", "WAL")
-            .pragma("synchronous", "NORMAL")
-            .pragma("foreign_keys", "ON")
-            .pragma("busy_timeout", "5000");
+        let opts = PgConnectOptions::from_str(database_url)
+            .map_err(|e| ExecutorError::Internal(e.to_string()))?;
+        Self::open_with_options(opts).await
+    }
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+    /// Same as [`open`](Self::open) but takes a pre-built
+    /// `PgConnectOptions`. Crate-private because the only legitimate
+    /// caller is the test harness in `test_support`, which builds
+    /// options against an admin URL and swaps in a per-test database
+    /// name. Production code goes through `Storage::open(&str)`.
+    pub(crate) async fn open_with_options(
+        opts: PgConnectOptions,
+    ) -> Result<Self, ExecutorError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .min_connections(0)
+            .idle_timeout(Some(Duration::from_secs(60)))
+            .acquire_timeout(Duration::from_secs(30))
             .connect_with(opts)
             .await?;
 
-        sqlx::query(SCHEMA_SQL).execute(&pool).await?;
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(|e| ExecutorError::Internal(format!("migrate: {e}")))?;
+
         Ok(Self { pool })
     }
 
-    pub fn pool(&self) -> &SqlitePool { &self.pool }
+    /// Crate-private accessor used only by `test_support`. Compiled
+    /// out of production builds so app code cannot reach the raw pool
+    /// — new queries must go on `Storage` as typed methods.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Close the pool. Awaits in-flight connections so callers that
+    /// drain subsystems before exit can be sure the database has
+    /// released its resources.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    /// Look up the `WorkflowId` whose stored `github.pr_opened.v1` event
+    /// matches `(owner, name, pr_number)`. Owner and name are compared
+    /// case-insensitively (GitHub normalizes them server-side).
+    ///
+    /// Returns:
+    /// - `Ok(Some(id))` — found a matching workflow.
+    /// - `Ok(None)` — no row matched. Definitively not a tracked PR.
+    /// - `Err(_)` — the query itself failed; caller MUST treat as
+    ///   transient (HTTP 500) so the delivery is retried.
+    pub async fn find_pr_workflow_id(
+        &self,
+        owner: &str,
+        name: &str,
+        pr_number: u64,
+    ) -> Result<Option<WorkflowId>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT workflow_id FROM events
+            WHERE payload_type = 'github.pr_opened.v1'
+              AND lower(payload->'repo'->>'owner') = lower($1)
+              AND lower(payload->'repo'->>'name')  = lower($2)
+              AND (payload->>'pr_number')::bigint  = $3
+            ORDER BY recorded_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(owner)
+        .bind(name)
+        .bind(pr_number as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        Ok(Some(WorkflowId::new(r.try_get::<String, _>("workflow_id")?)))
+    }
+
+    /// Look up the prior `TicketIngested` event for `dedup_key` and
+    /// return its payload if present. The caller compares against the
+    /// new payload to distinguish idempotent re-posts (matching) from
+    /// configuration drift (mismatch → 409).
+    pub async fn find_prior_ticket_payload(
+        &self,
+        dedup_key: &str,
+    ) -> Result<Option<Json>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT payload FROM events
+            WHERE ingress_dedup_key = $1
+              AND payload_type = 'workflow.ticket_ingested.v1'
+            LIMIT 1
+            "#,
+        )
+        .bind(dedup_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        Ok(Some(r.try_get::<Json, _>("payload")?))
+    }
 
     /// The core method. Atomically:
     ///   1. Checks ingress dedup
@@ -82,7 +173,7 @@ impl Storage {
 
         // Read current head sequence for this workflow.
         let current: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(sequence) FROM events WHERE workflow_id = ?",
+            "SELECT MAX(sequence) FROM events WHERE workflow_id = $1",
         )
         .bind(cmd.workflow_id.as_str())
         .fetch_one(&mut *tx)
@@ -121,7 +212,6 @@ impl Storage {
         let actions = reducer.derive_actions(&new_state, &envelope)?;
 
         // Insert the event. PK collision = SequenceConflict.
-        let payload_str = serde_json::to_string(&cmd.payload)?;
         let causation_kind = cmd.causation.kind();
         let causation_ref = cmd.causation.ref_id();
 
@@ -131,7 +221,7 @@ impl Storage {
                 workflow_id, sequence, event_id, recorded_at,
                 payload_type, payload_schema_version,
                 causation_kind, causation_ref, payload, ingress_dedup_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(cmd.workflow_id.as_str())
@@ -142,7 +232,7 @@ impl Storage {
         .bind(cmd.payload_schema_version as i64)
         .bind(causation_kind)
         .bind(causation_ref)
-        .bind(&payload_str)
+        .bind(&cmd.payload)
         .bind(cmd.ingress_dedup_key.as_deref())
         .execute(&mut *tx)
         .await;
@@ -176,11 +266,10 @@ impl Storage {
 
         // Update snapshot.
         let state_json = state_to_json(&new_state)?;
-        let state_str = serde_json::to_string(&state_json)?;
         sqlx::query(
             r#"
             INSERT INTO snapshots (workflow_id, sequence, state_blob, state_version, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT(workflow_id) DO UPDATE SET
                 sequence      = excluded.sequence,
                 state_blob    = excluded.state_blob,
@@ -190,7 +279,7 @@ impl Storage {
         )
         .bind(cmd.workflow_id.as_str())
         .bind(next_seq as i64)
-        .bind(&state_str)
+        .bind(&state_json)
         .bind(reducer.state_version() as i64)
         .bind(recorded_at)
         .execute(&mut *tx)
@@ -226,6 +315,10 @@ impl Storage {
     /// `kinds_filter`: if non-empty, only actions whose kind is in this set
     /// are claimed. Used by the dispatcher to skip kinds belonging to
     /// unhealthy sinks.
+    ///
+    /// Postgres implementation uses a single statement that selects
+    /// candidate rows with `FOR UPDATE SKIP LOCKED` and updates them in
+    /// place, so concurrent dispatchers never claim the same row.
     #[instrument(skip(self, kinds_filter), fields(dispatcher = %dispatcher_id))]
     pub async fn claim_actions(
         &self,
@@ -242,101 +335,64 @@ impl Storage {
             return Ok(vec![]);
         }
 
-        let mut tx = self.pool.begin().await?;
+        let kinds_owned: Vec<String> = kinds_filter.iter().map(|s| s.to_string()).collect();
 
-        // Build a parameterized IN clause for kinds.
-        let placeholders: String = (0..kinds_filter.len())
-            .map(|_| "?".to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let candidate_sql = format!(
+        let rows = sqlx::query(
             r#"
-            SELECT action_id FROM actions_outbox
-            WHERE state = 'pending'
-              AND next_attempt_at <= ?
-              AND action_kind IN ({})
-            UNION ALL
-            SELECT action_id FROM actions_outbox
-            WHERE state = 'in_progress'
-              AND lease_expires_at <= ?
-              AND action_kind IN ({})
-            LIMIT ?
-            "#,
-            placeholders, placeholders
-        );
-
-        let mut q = sqlx::query_scalar::<_, String>(&candidate_sql).bind(now);
-        for k in kinds_filter {
-            q = q.bind(*k);
-        }
-        q = q.bind(now);
-        for k in kinds_filter {
-            q = q.bind(*k);
-        }
-        q = q.bind(batch_size as i64);
-
-        let candidates: Vec<String> = q.fetch_all(&mut *tx).await?;
-
-        if candidates.is_empty() {
-            tx.rollback().await?;
-            return Ok(vec![]);
-        }
-
-        let mut claimed = Vec::with_capacity(candidates.len());
-        for action_id_str in candidates {
-            // Set lease. Do NOT increment attempt - that happens on outcome only.
-            let row = sqlx::query(
-                r#"
-                UPDATE actions_outbox
-                SET state            = 'in_progress',
-                    claimed_by       = ?,
-                    lease_expires_at = ?,
-                    updated_at       = ?
-                WHERE action_id = ?
-                  AND (state = 'pending'
-                       OR (state = 'in_progress' AND lease_expires_at <= ?))
-                RETURNING workflow_id, source_sequence, action_kind, payload,
-                          attempt, max_attempts, probe_attempt, max_probe_attempts
-                "#,
+            UPDATE actions_outbox
+            SET state            = 'in_progress',
+                claimed_by       = $1,
+                lease_expires_at = $2,
+                updated_at       = $3
+            WHERE action_id IN (
+                SELECT action_id FROM actions_outbox
+                WHERE action_kind = ANY($4)
+                  AND ((state = 'pending' AND next_attempt_at <= $5)
+                       OR (state = 'in_progress' AND lease_expires_at <= $5))
+                ORDER BY next_attempt_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $6
             )
-            .bind(dispatcher_id.as_str())
-            .bind(lease_expires)
-            .bind(now)
-            .bind(&action_id_str)
-            .bind(now)
-            .fetch_optional(&mut *tx)
-            .await?;
+            RETURNING action_id, workflow_id, source_sequence, action_kind, payload,
+                      attempt, max_attempts, probe_attempt, max_probe_attempts
+            "#,
+        )
+        .bind(dispatcher_id.as_str())
+        .bind(lease_expires)
+        .bind(now)
+        .bind(&kinds_owned)
+        .bind(now)
+        .bind(batch_size as i64)
+        .fetch_all(&self.pool)
+        .await?;
 
-            if let Some(row) = row {
-                let workflow_id: String = row.get("workflow_id");
-                let source_sequence: i64 = row.get("source_sequence");
-                let kind: String = row.get("action_kind");
-                let payload_str: String = row.get("payload");
-                let attempt: i64 = row.get("attempt");
-                let max_attempts: i64 = row.get("max_attempts");
-                let probe_attempt: i64 = row.get("probe_attempt");
-                let max_probe_attempts: i64 = row.get("max_probe_attempts");
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let action_id: String = row.get("action_id");
+            let workflow_id: String = row.get("workflow_id");
+            let source_sequence: i64 = row.get("source_sequence");
+            let kind: String = row.get("action_kind");
+            let payload: Json = row.get("payload");
+            let attempt: i64 = row.get("attempt");
+            let max_attempts: i64 = row.get("max_attempts");
+            let probe_attempt: i64 = row.get("probe_attempt");
+            let max_probe_attempts: i64 = row.get("max_probe_attempts");
 
-                let payload: Json = serde_json::from_str(&payload_str)?;
-
-                claimed.push(ClaimedAction {
-                    action_id: ActionId(action_id_str),
-                    workflow_id: WorkflowId(workflow_id),
-                    source_sequence: source_sequence as u64,
-                    kind,
-                    payload,
-                    attempt: attempt as u32,
-                    max_attempts: max_attempts as u32,
-                    probe_attempt: probe_attempt as u32,
-                    max_probe_attempts: max_probe_attempts as u32,
-                    claimed_by: dispatcher_id.clone(),
-                    lease_expires_at: lease_expires,
-                });
-            }
-            // If row is None, someone else claimed it between our SELECT and UPDATE.
+            claimed.push(ClaimedAction {
+                action_id: ActionId(action_id),
+                workflow_id: WorkflowId(workflow_id),
+                source_sequence: source_sequence as u64,
+                kind,
+                payload,
+                attempt: attempt as u32,
+                max_attempts: max_attempts as u32,
+                probe_attempt: probe_attempt as u32,
+                max_probe_attempts: max_probe_attempts as u32,
+                claimed_by: dispatcher_id.clone(),
+                lease_expires_at: lease_expires,
+            });
         }
 
-        tx.commit().await?;
         Ok(claimed)
     }
 
@@ -354,7 +410,7 @@ impl Storage {
         sqlx::query(
             r#"
             INSERT INTO action_attempts (action_id, attempt, started_at)
-            VALUES (?, ?, ?)
+            VALUES ($1, $2, $3)
             ON CONFLICT(action_id, attempt) DO NOTHING
             "#,
         )
@@ -381,8 +437,8 @@ impl Storage {
         let rows = sqlx::query(
             r#"
             UPDATE actions_outbox
-            SET lease_expires_at = ?, updated_at = ?
-            WHERE action_id = ? AND claimed_by = ? AND state = 'in_progress'
+            SET lease_expires_at = $1, updated_at = $2
+            WHERE action_id = $3 AND claimed_by = $4 AND state = 'in_progress'
             "#,
         )
         .bind(new_expiry)
@@ -419,7 +475,7 @@ impl Storage {
         let row = sqlx::query(
             r#"
             SELECT attempt FROM actions_outbox
-            WHERE action_id = ? AND claimed_by = ? AND state = 'in_progress'
+            WHERE action_id = $1 AND claimed_by = $2 AND state = 'in_progress'
             "#,
         )
         .bind(action_id.as_str())
@@ -438,13 +494,13 @@ impl Storage {
             r#"
             UPDATE actions_outbox
             SET state            = 'succeeded',
-                attempt          = ?,
-                external_ref     = COALESCE(?, external_ref),
-                outcome_event_id = ?,
+                attempt          = $1,
+                external_ref     = COALESCE($2, external_ref),
+                outcome_event_id = $3,
                 claimed_by       = NULL,
                 lease_expires_at = NULL,
-                updated_at       = ?
-            WHERE action_id = ?
+                updated_at       = $4
+            WHERE action_id = $5
             "#,
         )
         .bind(new_attempt)
@@ -458,8 +514,8 @@ impl Storage {
         sqlx::query(
             r#"
             UPDATE action_attempts
-            SET finished_at = ?, outcome = 'success', external_ref = ?
-            WHERE action_id = ? AND attempt = ?
+            SET finished_at = $1, outcome = 'success', external_ref = $2
+            WHERE action_id = $3 AND attempt = $4
             "#,
         )
         .bind(now)
@@ -490,7 +546,7 @@ impl Storage {
         let row = sqlx::query(
             r#"
             SELECT attempt, max_attempts FROM actions_outbox
-            WHERE action_id = ? AND claimed_by = ? AND state = 'in_progress'
+            WHERE action_id = $1 AND claimed_by = $2 AND state = 'in_progress'
             "#,
         )
         .bind(action_id.as_str())
@@ -513,12 +569,12 @@ impl Storage {
                 r#"
                 UPDATE actions_outbox
                 SET state            = 'failed',
-                    attempt          = ?,
-                    last_error       = ?,
+                    attempt          = $1,
+                    last_error       = $2,
                     claimed_by       = NULL,
                     lease_expires_at = NULL,
-                    updated_at       = ?
-                WHERE action_id = ?
+                    updated_at       = $3
+                WHERE action_id = $4
                 "#,
             )
             .bind(new_attempt)
@@ -531,9 +587,9 @@ impl Storage {
             sqlx::query(
                 r#"
                 UPDATE action_attempts
-                SET finished_at = ?, outcome = 'permanent_fail',
-                    error_kind = 'budget_exhausted', error_message = ?
-                WHERE action_id = ? AND attempt = ?
+                SET finished_at = $1, outcome = 'permanent_fail',
+                    error_kind = 'budget_exhausted', error_message = $2
+                WHERE action_id = $3 AND attempt = $4
                 "#,
             )
             .bind(now)
@@ -555,13 +611,13 @@ impl Storage {
             r#"
             UPDATE actions_outbox
             SET state            = 'pending',
-                attempt          = ?,
-                next_attempt_at  = ?,
-                last_error       = ?,
+                attempt          = $1,
+                next_attempt_at  = $2,
+                last_error       = $3,
                 claimed_by       = NULL,
                 lease_expires_at = NULL,
-                updated_at       = ?
-            WHERE action_id = ?
+                updated_at       = $4
+            WHERE action_id = $5
             "#,
         )
         .bind(new_attempt)
@@ -575,8 +631,8 @@ impl Storage {
         sqlx::query(
             r#"
             UPDATE action_attempts
-            SET finished_at = ?, outcome = 'transient_fail', error_message = ?
-            WHERE action_id = ? AND attempt = ?
+            SET finished_at = $1, outcome = 'transient_fail', error_message = $2
+            WHERE action_id = $3 AND attempt = $4
             "#,
         )
         .bind(now)
@@ -604,7 +660,7 @@ impl Storage {
         let prior_attempt: Option<i64> = sqlx::query_scalar(
             r#"
             SELECT attempt FROM actions_outbox
-            WHERE action_id = ? AND claimed_by = ? AND state = 'in_progress'
+            WHERE action_id = $1 AND claimed_by = $2 AND state = 'in_progress'
             "#,
         )
         .bind(action_id.as_str())
@@ -622,12 +678,12 @@ impl Storage {
             r#"
             UPDATE actions_outbox
             SET state            = 'failed',
-                attempt          = ?,
-                last_error       = ?,
+                attempt          = $1,
+                last_error       = $2,
                 claimed_by       = NULL,
                 lease_expires_at = NULL,
-                updated_at       = ?
-            WHERE action_id = ?
+                updated_at       = $3
+            WHERE action_id = $4
             "#,
         )
         .bind(new_attempt)
@@ -640,8 +696,8 @@ impl Storage {
         sqlx::query(
             r#"
             UPDATE action_attempts
-            SET finished_at = ?, outcome = 'permanent_fail', error_message = ?
-            WHERE action_id = ? AND attempt = ?
+            SET finished_at = $1, outcome = 'permanent_fail', error_message = $2
+            WHERE action_id = $3 AND attempt = $4
             "#,
         )
         .bind(now)
@@ -674,12 +730,12 @@ impl Storage {
             r#"
             UPDATE actions_outbox
             SET state            = 'pending',
-                next_attempt_at  = ?,
-                last_error       = ?,
+                next_attempt_at  = $1,
+                last_error       = $2,
                 claimed_by       = NULL,
                 lease_expires_at = NULL,
-                updated_at       = ?
-            WHERE action_id = ? AND claimed_by = ? AND state = 'in_progress'
+                updated_at       = $3
+            WHERE action_id = $4 AND claimed_by = $5 AND state = 'in_progress'
             "#,
         )
         .bind(next_at)
@@ -717,7 +773,7 @@ impl Storage {
         let row = sqlx::query(
             r#"
             SELECT probe_attempt, max_probe_attempts FROM actions_outbox
-            WHERE action_id = ? AND claimed_by = ? AND state = 'in_progress'
+            WHERE action_id = $1 AND claimed_by = $2 AND state = 'in_progress'
             "#,
         )
         .bind(action_id.as_str())
@@ -740,12 +796,12 @@ impl Storage {
                 r#"
                 UPDATE actions_outbox
                 SET state            = 'failed_probe_exhausted',
-                    probe_attempt    = ?,
-                    last_error       = ?,
+                    probe_attempt    = $1,
+                    last_error       = $2,
                     claimed_by       = NULL,
                     lease_expires_at = NULL,
-                    updated_at       = ?
-                WHERE action_id = ?
+                    updated_at       = $3
+                WHERE action_id = $4
                 "#,
             )
             .bind(new_probe)
@@ -768,13 +824,13 @@ impl Storage {
             r#"
             UPDATE actions_outbox
             SET state            = 'pending',
-                probe_attempt    = ?,
-                next_attempt_at  = ?,
-                last_error       = ?,
+                probe_attempt    = $1,
+                next_attempt_at  = $2,
+                last_error       = $3,
                 claimed_by       = NULL,
                 lease_expires_at = NULL,
-                updated_at       = ?
-            WHERE action_id = ?
+                updated_at       = $4
+            WHERE action_id = $5
             "#,
         )
         .bind(new_probe)
@@ -805,7 +861,7 @@ impl Storage {
             INSERT INTO sink_health (
                 sink_key, state, reason, detail,
                 updated_at, last_check_at, next_check_at
-            ) VALUES (?, 'unhealthy', ?, ?, ?, ?, ?)
+            ) VALUES ($1, 'unhealthy', $2, $3, $4, $5, $6)
             ON CONFLICT(sink_key) DO UPDATE SET
                 state         = 'unhealthy',
                 reason        = excluded.reason,
@@ -835,7 +891,7 @@ impl Storage {
             INSERT INTO sink_health (
                 sink_key, state, reason, detail,
                 updated_at, last_check_at, next_check_at
-            ) VALUES (?, 'healthy', NULL, NULL, ?, ?, NULL)
+            ) VALUES ($1, 'healthy', NULL, NULL, $2, $3, NULL)
             ON CONFLICT(sink_key) DO UPDATE SET
                 state         = 'healthy',
                 reason        = NULL,
@@ -863,7 +919,7 @@ impl Storage {
             SELECT sink_key, state, reason, detail,
                    updated_at, last_check_at, next_check_at
             FROM sink_health
-            WHERE sink_key = ?
+            WHERE sink_key = $1
             "#,
         )
         .bind(sink_key)
@@ -944,38 +1000,28 @@ impl Storage {
             return Ok(SinkHealthScope::default());
         }
 
-        let placeholders: String = (0..active_kinds.len())
-            .map(|_| "?".to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
+        let kinds_owned: Vec<String> = active_kinds.iter().map(|s| s.to_string()).collect();
+        // Read 4x the hint cap to give dedup room.
+        let limit = (max_hints as i64).saturating_mul(4).max(40);
+
+        let rows = sqlx::query(
             r#"
             SELECT action_kind, payload FROM actions_outbox
             WHERE state IN ('pending', 'in_progress')
-              AND action_kind IN ({})
+              AND action_kind = ANY($1)
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT $2
             "#,
-            placeholders
-        );
-
-        let mut q = sqlx::query(&sql);
-        for k in active_kinds {
-            q = q.bind(*k);
-        }
-        // Read 4x the hint cap to give dedup room.
-        q = q.bind((max_hints as i64).saturating_mul(4).max(40));
-
-        let rows = q.fetch_all(&self.pool).await?;
+        )
+        .bind(&kinds_owned)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
 
         let mut hints: Vec<EndpointHint> = Vec::new();
         for row in rows {
             let kind: String = row.get("action_kind");
-            let payload_str: String = row.get("payload");
-            let payload: Json = match serde_json::from_str(&payload_str) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let payload: Json = row.get("payload");
             for ex in extractors {
                 if let Some(hint) = ex.extract(&kind, &payload) {
                     if !hints.contains(&hint) {
@@ -1008,7 +1054,7 @@ impl Storage {
                    payload_type, payload_schema_version,
                    causation_kind, causation_ref, payload
             FROM events
-            WHERE workflow_id = ?
+            WHERE workflow_id = $1
             ORDER BY sequence ASC
             "#,
         )
@@ -1018,8 +1064,7 @@ impl Storage {
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let payload_str: String = row.get("payload");
-            let payload: Json = serde_json::from_str(&payload_str)?;
+            let payload: Json = row.get("payload");
             let causation = decode_causation(
                 row.get::<&str, _>("causation_kind"),
                 row.get::<Option<String>, _>("causation_ref"),
@@ -1050,23 +1095,22 @@ impl Storage {
 /// reducer schema bump) replay the event log to reconstruct state from
 /// scratch. Snapshots are a cache; the event log is authoritative.
 async fn load_prior_state<R: Reducer>(
-    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    tx: &mut Transaction<'_, Postgres>,
     reducer: &R,
     workflow_id: &WorkflowId,
 ) -> Result<R::State, ExecutorError> {
     let row = sqlx::query(
-        "SELECT state_blob, state_version FROM snapshots WHERE workflow_id = ?",
+        "SELECT state_blob, state_version FROM snapshots WHERE workflow_id = $1",
     )
     .bind(workflow_id.as_str())
     .fetch_optional(&mut **tx)
     .await?;
 
     if let Some(row) = row {
-        let blob: String = row.get("state_blob");
+        let blob: Json = row.get("state_blob");
         let version: i64 = row.get("state_version");
         if version as u32 == reducer.state_version() {
-            let parsed: Json = serde_json::from_str(&blob)?;
-            return state_from_json(Some(parsed));
+            return state_from_json(Some(blob));
         }
         // Version mismatch — fall through to replay.
         tracing::info!(
@@ -1083,7 +1127,7 @@ async fn load_prior_state<R: Reducer>(
 /// Rebuild state by replaying every event for a workflow through the
 /// reducer in order. Used when no usable snapshot exists.
 async fn replay_state_in_tx<R: Reducer>(
-    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    tx: &mut Transaction<'_, Postgres>,
     reducer: &R,
     workflow_id: &WorkflowId,
 ) -> Result<R::State, ExecutorError> {
@@ -1093,7 +1137,7 @@ async fn replay_state_in_tx<R: Reducer>(
                payload_type, payload_schema_version,
                causation_kind, causation_ref, payload
         FROM events
-        WHERE workflow_id = ?
+        WHERE workflow_id = $1
         ORDER BY sequence ASC
         "#,
     )
@@ -1103,8 +1147,7 @@ async fn replay_state_in_tx<R: Reducer>(
 
     let mut state: R::State = state_from_json(None)?;
     for row in rows {
-        let payload_str: String = row.get("payload");
-        let payload: Json = serde_json::from_str(&payload_str)?;
+        let payload: Json = row.get("payload");
         let causation = decode_causation(
             row.get::<&str, _>("causation_kind"),
             row.get::<Option<String>, _>("causation_ref"),
@@ -1132,11 +1175,11 @@ struct PriorOutcome {
 }
 
 async fn lookup_by_dedup_key(
-    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    tx: &mut Transaction<'_, Postgres>,
     key: &str,
 ) -> Result<Option<PriorOutcome>, ExecutorError> {
     let row = sqlx::query(
-        "SELECT event_id, sequence FROM events WHERE ingress_dedup_key = ? LIMIT 1",
+        "SELECT event_id, sequence FROM events WHERE ingress_dedup_key = $1 LIMIT 1",
     )
     .bind(key)
     .fetch_optional(&mut **tx)
@@ -1161,7 +1204,7 @@ async fn lookup_by_dedup_key(
 /// (typically the sequence PK), so the caller should fall through to
 /// `SequenceConflict`.
 pub(crate) async fn classify_unique_violation(
-    pool: &SqlitePool,
+    pool: &PgPool,
     dedup_key: Option<&str>,
 ) -> Result<Option<AdvanceOutcome>, ExecutorError> {
     let Some(key) = dedup_key else {
@@ -1170,7 +1213,7 @@ pub(crate) async fn classify_unique_violation(
         return Ok(None);
     };
     let row = sqlx::query(
-        "SELECT event_id, sequence FROM events WHERE ingress_dedup_key = ? LIMIT 1",
+        "SELECT event_id, sequence FROM events WHERE ingress_dedup_key = $1 LIMIT 1",
     )
     .bind(key)
     .fetch_optional(pool)
@@ -1184,14 +1227,13 @@ pub(crate) async fn classify_unique_violation(
 }
 
 async fn insert_outbox_row(
-    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    tx: &mut Transaction<'_, Postgres>,
     action_id: &ActionId,
     workflow_id: &WorkflowId,
     source_sequence: u64,
     action: &Action,
     now: DateTime<Utc>,
 ) -> Result<(), ExecutorError> {
-    let payload_str = serde_json::to_string(&action.payload)?;
     let next_at = now + ChronoDuration::seconds(action.delay_seconds as i64);
 
     sqlx::query(
@@ -1200,7 +1242,7 @@ async fn insert_outbox_row(
             action_id, workflow_id, source_sequence, action_kind, payload,
             state, attempt, max_attempts, probe_attempt, max_probe_attempts,
             next_attempt_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, 0, ?, ?, ?, ?)
+        ) VALUES ($1, $2, $3, $4, $5, 'pending', 0, $6, 0, $7, $8, $9, $10)
         ON CONFLICT(action_id) DO NOTHING
         "#,
     )
@@ -1208,7 +1250,7 @@ async fn insert_outbox_row(
     .bind(workflow_id.as_str())
     .bind(source_sequence as i64)
     .bind(&action.kind)
-    .bind(&payload_str)
+    .bind(&action.payload)
     .bind(action.max_attempts as i64)
     .bind(action.max_probe_attempts as i64)
     .bind(next_at)
@@ -1259,10 +1301,12 @@ fn backoff_duration(attempt: u32) -> ChronoDuration {
     let jitter = rand::thread_rng().gen_range(0..=(capped / 4));
     ChronoDuration::milliseconds((capped + jitter) as i64)
 }
+
 #[cfg(test)]
 mod classify_violation_tests {
     use super::*;
     use crate::reducer::Reducer;
+    use crate::test_support::fresh_storage;
     use serde::{Deserialize, Serialize};
 
     /// Minimal trivial reducer so we can exercise advance() without
@@ -1312,9 +1356,7 @@ mod classify_violation_tests {
 
     #[tokio::test]
     async fn classify_returns_some_when_dedup_row_exists() {
-        let storage = Storage::open("sqlite::memory:").await.unwrap();
-        // Land an event so a row exists in the events table with our
-        // dedup key. Going through advance is the simplest seeding.
+        let (storage, _db) = fresh_storage().await;
         let outcome = storage
             .advance(&NoopReducer, &cmd("wf-A", Some("dk-A")))
             .await
@@ -1332,20 +1374,14 @@ mod classify_violation_tests {
 
     #[tokio::test]
     async fn classify_returns_none_when_dedup_key_is_absent() {
-        let storage = Storage::open("sqlite::memory:").await.unwrap();
-        // No dedup key on the cmd at all → cannot have been a dedup
-        // index violation; classifier returns None so the caller
-        // surfaces SequenceConflict.
+        let (storage, _db) = fresh_storage().await;
         let result = classify_unique_violation(storage.pool(), None).await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn classify_returns_none_when_dedup_row_does_not_exist() {
-        let storage = Storage::open("sqlite::memory:").await.unwrap();
-        // Dedup key supplied but no matching row was ever written.
-        // The violation must therefore have been on a different unique
-        // index (i.e., the sequence PK).
+        let (storage, _db) = fresh_storage().await;
         let result = classify_unique_violation(storage.pool(), Some("never-written"))
             .await
             .unwrap();

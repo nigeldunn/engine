@@ -21,10 +21,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net
 # HTTP server (for the webhook + ticket-ingest endpoints)
 axum = "0.8"
 
-# SQL access for the (repo, pr_number) -> workflow_id resolver query.
-# Storage exposes its SqlitePool publicly so the app can run app-specific
-# routing queries without leaking schema concerns into orchestrator-core.
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+# Used for the bearer-token-protected ticket dedup-conflict lookup; the
+# concrete pool type is owned by orchestrator-core, but the app re-binds
+# parameters via sqlx::query for a couple of routing-only queries.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
 serde_json = "1"
 
 # Constant-time bearer-token comparison.
@@ -46,6 +46,10 @@ tracing-appender = "0.2"
 thiserror = "2"
 
 [dev-dependencies]
+# Re-list with `test-support` so tests get the per-test DB harness from
+# orchestrator-core. The feature is non-default, so production builds
+# never see the privileged helpers.
+orchestrator-core = { path = "../orchestrator-core", features = ["test-support"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http = "1"

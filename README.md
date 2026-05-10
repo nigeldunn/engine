@@ -55,7 +55,7 @@ A small, opinionated workflow engine with these properties:
 │                                  └──────────┘    │                   │
 │                                                  ▼                   │
 │                                            ┌──────────┐              │
-│                                            │ SQLite   │              │
+│                                            │ Postgres │              │
 │                                            │ Storage  │              │
 │                                            └────┬─────┘              │
 │                                                 │                    │
@@ -121,7 +121,7 @@ impl Sink for MySink {
 }
 
 // 3. Wire it up.
-let storage = Storage::open("sqlite:///var/lib/orchestrator.db").await?;
+let storage = Storage::open("postgres://orch:orch@localhost:5432/orch").await?;
 let executor = std::sync::Arc::new(Executor::new(storage, MyReducer));
 let mut dispatcher = Dispatcher::new(executor.clone(), DispatcherConfig::default());
 dispatcher.register(MySink::new());
@@ -145,7 +145,7 @@ executor.advance(EventCommand {
 
 ## Storage layout
 
-Six tables, all in SQLite:
+Six tables, all in PostgreSQL:
 
 | Table | Purpose |
 |---|---|
@@ -156,7 +156,7 @@ Six tables, all in SQLite:
 | `sink_health` | Persisted sink health, keyed on `sink_key`. |
 | `workflow_configs` | Content-addressed config snapshots, for replay fidelity. |
 
-Schema in `crates/orchestrator-core/src/schema.sql`. JSON payloads in TEXT columns for v1 — query with SQLite's JSON functions for debugging.
+Schema lives in `crates/orchestrator-core/migrations/`, applied via `sqlx::migrate!` at `Storage::open`. Payloads are JSONB; query with `payload->'field'` / `payload->>'field'` for debugging.
 
 ## Idempotency in three places
 
@@ -179,13 +179,25 @@ The integration tests under `crates/orchestrator-core/tests/end_to_end.rs` and `
 
 ## Building and testing
 
-Requires Rust 1.75+.
+Requires Rust 1.75+ and Docker.
+
+The test suite needs a running Postgres. The repo ships a `docker-compose.yml`
+that brings up Postgres 16 with the credentials the test harness expects:
 
 ```sh
+docker compose up -d
+export TEST_DATABASE_URL=postgres://orch:orch@localhost:5432/orch
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Each test creates and uses its own `test_<uuid>` database against the
+admin connection in `TEST_DATABASE_URL`, so suites are isolated even
+under `cargo test`'s default parallelism. Orphaned test databases are
+not cleaned up automatically (see `orchestrator_core::test_support::DbGuard`
+docs for why); reset with `docker compose down -v` when the admin
+database starts feeling crowded.
 
 For verbose tracing during tests:
 

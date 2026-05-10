@@ -67,6 +67,12 @@ When a sink reports unhealthy, the dispatcher writes to the `sink_health` table.
 
 Existing columns and tables don't change. New columns are added with defaults. New tables go alongside the old ones. The reducer-input event schema evolves via `payload_type` versioning (e.g., `my_event.v1` → `my_event.v2`), not by mutation.
 
+This rule applies from `crates/orchestrator-core/migrations/0001_initial.sql` onward. **Never edit `0001_initial.sql`** — schema changes go in a new migration file (`0002_*.sql`, `0003_*.sql`, …). The one-time SQLite-to-Postgres backend cut-over is the only exception, and it's already done.
+
+### 10. `Storage::pool()` is crate-private
+
+`Storage` exposes typed methods (`find_pr_workflow_id`, `find_prior_ticket_payload`, `read_events`, etc.). The raw `pool()` accessor is `pub(crate)` and only `orchestrator-core` itself (including its `test_support` module) may call it. App code that needs a new query must add a typed method to `Storage` rather than reaching into the pool.
+
 ## Type system conventions
 
 - IDs are typed wrappers around `String` (`WorkflowId`, `EventId`, `ActionId`, `DispatcherId`). They all impl `Display`. Never use bare strings for IDs.
@@ -80,8 +86,8 @@ Existing columns and tables don't change. New columns are added with defaults. N
 - **Errors:** thiserror-derived enums per layer (`ExecutorError`, `DispatcherError`). Never `Box<dyn Error>` or `anyhow::Error` in public APIs.
 - **Logging:** `tracing` only, never `println!` or `eprintln!`. Use `#[instrument]` on public async methods. Field bindings use `%` for `Display` and `?` for `Debug`.
 - **Async:** Tokio runtime. Use `async-trait` for trait methods. Spawned tasks should always be reaped by their owner; no detached `tokio::spawn` in long-lived loops.
-- **SQLite:** sqlx with `runtime-tokio`, `sqlite`, `chrono`, `json` features. Use `BEGIN/COMMIT` via `pool.begin()`, never raw SQL transactions. Bind values explicitly; never format SQL with user input.
-- **Tests:** integration tests in `tests/`, unit tests inline. Tests use `sqlite::memory:` for fast isolated databases, or `tempfile::TempDir` when persistence across reopens is being tested.
+- **Postgres:** sqlx with `runtime-tokio`, `postgres`, `migrate`, `chrono`, `json`, `macros` features. Use `pool.begin()` for transactions, never raw `BEGIN/COMMIT`. Bind values explicitly with `$N` placeholders; never format SQL with user input. Migrations live in `crates/orchestrator-core/migrations/` and run at `Storage::open` via `sqlx::migrate!`.
+- **Tests:** integration tests in `tests/`, unit tests inline. Tests get a per-test Postgres database via `orchestrator_core::test_support::fresh_storage().await` (returns `(Storage, DbGuard)`); the suite requires `TEST_DATABASE_URL` pointing at the docker-compose Postgres. Tests that need to verify reopen-across-restart behaviour use `test_support::reopen(&guard)`.
 - **Imports:** Group by std → external → crate. Don't `use crate::*`.
 
 ## Things that look like they should work but don't
@@ -133,7 +139,7 @@ The GitHub sink design (in `PLAN.md`) is the canonical example.
 - Tests should be deterministic. Use atomic counters for invocation tracking, not random delays.
 - Use short timeouts in test configs so tests fail fast on hangs. The standard setup uses 50ms poll, 100ms unhealthy retry, 200ms health check interval.
 - Tests that expect retry/recovery behavior should poll on observable state (events, sink health table, invocation counts) with a generous bound (e.g., 5s of retries). Don't rely on fixed sleeps.
-- Tests that need persistence across reopens use `tempfile::TempDir` for an on-disk database.
+- Tests that need persistence across reopens use `orchestrator_core::test_support::reopen(&guard)` to get a fresh `Storage` against the same per-test database.
 
 ## When to ask the human vs proceed
 

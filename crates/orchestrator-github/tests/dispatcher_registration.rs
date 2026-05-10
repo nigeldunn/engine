@@ -59,7 +59,7 @@ async fn github_sink_registers_with_dispatcher() {
 
     // Register with a real Dispatcher. If the trait shape didn't match,
     // this wouldn't compile.
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = orchestrator_core::test_support::fresh_storage().await;
     let executor = Arc::new(Executor::new(storage, NoopReducer));
     let mut dispatcher = Dispatcher::new(executor, DispatcherConfig::default());
     dispatcher.register(sink);

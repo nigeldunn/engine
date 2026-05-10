@@ -13,6 +13,9 @@ pub mod reducer;
 pub mod sink;
 pub mod slug;
 pub mod storage;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 
 pub use action::{Action, ActionState, AttemptOutcome, ClaimedAction};
 pub use action_builder::{ActionBuilder, ActionRef};

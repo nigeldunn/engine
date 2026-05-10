@@ -7,6 +7,7 @@
 //!   - Probe attempt counter doesn't burn execute attempts
 
 use async_trait::async_trait;
+use orchestrator_core::test_support::{fresh_storage, reopen};
 use orchestrator_core::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -165,8 +166,9 @@ async fn setup_dispatcher() -> (
     Arc<Executor<CounterReducer>>,
     CountingSinkHandles,
     Arc<tokio::sync::Notify>,
+    orchestrator_core::test_support::DbGuard,
 ) {
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, db) = fresh_storage().await;
     let executor = Arc::new(Executor::new(storage, CounterReducer));
     let mut dispatcher = Dispatcher::new(
         executor.clone(),
@@ -182,13 +184,15 @@ async fn setup_dispatcher() -> (
     dispatcher.register(sink);
     let shutdown = dispatcher.shutdown_handle();
     tokio::spawn(dispatcher.run());
-    (executor, handles, shutdown)
+    // Caller binds `db` so the per-test database survives until the
+    // test scope ends; only then does the guard's Drop schedule cleanup.
+    (executor, handles, shutdown, db)
 }
 
 #[tokio::test]
 async fn happy_path_increment_to_done() {
     let _ = tracing_subscriber::fmt::try_init();
-    let (executor, _handles, shutdown) = setup_dispatcher().await;
+    let (executor, _handles, shutdown, _db) = setup_dispatcher().await;
 
     let workflow_id = WorkflowId::new("wf-happy");
     let outcome = executor
@@ -227,7 +231,7 @@ async fn happy_path_increment_to_done() {
 #[tokio::test]
 async fn ingress_dedup_returns_prior_outcome() {
     let _ = tracing_subscriber::fmt::try_init();
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
     let executor = Executor::new(storage, CounterReducer);
 
     let workflow_id = WorkflowId::new("wf-dedup");
@@ -266,13 +270,9 @@ async fn deterministic_action_id() {
 /// (simulating a process restart). Demonstrates the persisted-health bug fix.
 #[tokio::test]
 async fn sink_health_persists_across_storage_reopens() {
-    use tempfile::TempDir;
     let _ = tracing_subscriber::fmt::try_init();
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("test.db");
-    let url = format!("sqlite://{}", db_path.display());
+    let (storage, db) = fresh_storage().await;
 
-    let storage = Storage::open(&url).await.unwrap();
     storage
         .mark_sink_unhealthy(
             "github",
@@ -285,9 +285,11 @@ async fn sink_health_persists_across_storage_reopens() {
     let keys = storage.unhealthy_sink_keys().await.unwrap();
     assert_eq!(keys, vec!["github".to_string()]);
 
-    // Drop and reopen.
+    // Drop and reopen against the same per-test database, simulating a
+    // process restart. `reopen` opens a brand-new pool so connection
+    // state does not survive — only what's in the persisted tables.
     drop(storage);
-    let storage = Storage::open(&url).await.unwrap();
+    let storage = reopen(&db).await;
     let keys = storage.unhealthy_sink_keys().await.unwrap();
     assert_eq!(
         keys,
@@ -306,7 +308,7 @@ async fn sink_health_persists_across_storage_reopens() {
 #[tokio::test]
 async fn sink_unhealthy_does_not_burn_attempt() {
     let _ = tracing_subscriber::fmt::try_init();
-    let (executor, handles, shutdown) = setup_dispatcher().await;
+    let (executor, handles, shutdown, _db) = setup_dispatcher().await;
 
     handles.unhealthy.store(true, Ordering::SeqCst);
     // Health check returns "still unhealthy" until we flip it.
@@ -378,7 +380,7 @@ async fn sink_unhealthy_does_not_burn_attempt() {
 #[tokio::test]
 async fn indeterminate_health_check_preserves_state() {
     let _ = tracing_subscriber::fmt::try_init();
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
 
     storage
         .mark_sink_unhealthy(
@@ -410,7 +412,7 @@ async fn indeterminate_health_check_preserves_state() {
 #[tokio::test]
 async fn dispatcher_shutdown_completes_promptly() {
     let _ = tracing_subscriber::fmt::try_init();
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
     let executor = Arc::new(Executor::new(storage, CounterReducer));
     let mut dispatcher = Dispatcher::new(
         executor,

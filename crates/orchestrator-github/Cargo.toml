@@ -32,6 +32,10 @@ tracing = "0.1"
 sha2 = "0.10"
 
 [dev-dependencies]
+# Re-list with `test-support` so tests get the per-test DB harness from
+# orchestrator-core. The feature is non-default, so production builds
+# never see the privileged helpers.
+orchestrator-core = { path = "../orchestrator-core", features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }

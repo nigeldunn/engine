@@ -11,7 +11,8 @@ use axum::http::{Request, StatusCode};
 use hmac::{Hmac, Mac};
 use orchestrator_app::server::build_webhook_router;
 use orchestrator_coding_workflow::WorkflowReducer;
-use orchestrator_core::{Executor, Storage, WorkflowId};
+use orchestrator_core::test_support::{fresh_storage, DbGuard};
+use orchestrator_core::{Executor, WorkflowId};
 use serde_json::json;
 use sha2::Sha256;
 use tower::ServiceExt;
@@ -23,8 +24,10 @@ const SECRET: &str = "shared-secret-for-tests";
 /// Tight retry budget so tests don't sit through the production 5s
 /// budget. Backoff equally short — we just need at least one extra
 /// attempt to demonstrate the loop runs.
-const TEST_BUDGET: Duration = Duration::from_millis(50);
-const TEST_BACKOFF: Duration = Duration::from_millis(10);
+/// Budget sized for Postgres connection-acquire + first-query overhead
+/// on a fresh per-test database (~50–100ms in practice). Still fast.
+const TEST_BUDGET: Duration = Duration::from_millis(500);
+const TEST_BACKOFF: Duration = Duration::from_millis(20);
 
 fn signed_post(
     secret: &str,
@@ -46,47 +49,16 @@ fn signed_post(
         .unwrap()
 }
 
-async fn fixture() -> Arc<Executor<WorkflowReducer>> {
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
-    Arc::new(Executor::new(storage, WorkflowReducer))
+async fn fixture() -> (Arc<Executor<WorkflowReducer>>, DbGuard) {
+    let (storage, db) = fresh_storage().await;
+    (Arc::new(Executor::new(storage, WorkflowReducer)), db)
 }
 
-async fn insert_pr_opened(
-    storage: &Storage,
-    workflow_id: &str,
-    owner: &str,
-    name: &str,
-    pr_number: u64,
-) {
-    let payload = json!({
-        "action_id": "test-action",
-        "repo": { "owner": owner, "name": name },
-        "pr_number": pr_number,
-        "html_url": format!("https://github.com/{owner}/{name}/pull/{pr_number}"),
-        "state": "open",
-    });
-    sqlx::query(
-        r#"
-        INSERT INTO events (
-            workflow_id, sequence, event_id, recorded_at,
-            payload_type, payload_schema_version,
-            causation_kind, causation_ref, payload, ingress_dedup_key
-        ) VALUES (?, ?, ?, ?, 'github.pr_opened.v1', 1, 'system', NULL, ?, NULL)
-        "#,
-    )
-    .bind(workflow_id)
-    .bind(0_i64)
-    .bind(format!("ev-{workflow_id}-{pr_number}"))
-    .bind("2026-01-01T00:00:00Z")
-    .bind(payload.to_string())
-    .execute(storage.pool())
-    .await
-    .unwrap();
-}
+use orchestrator_core::test_support::insert_pr_opened_event as insert_pr_opened;
 
 #[tokio::test]
 async fn signed_pull_request_merged_webhook_appends_pr_merged_event() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     insert_pr_opened(exec.storage(), "wf-route-1", "octo", "world", 42).await;
 
     let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
@@ -133,7 +105,7 @@ async fn webhook_for_truly_untracked_pr_returns_200_after_retry_budget() {
     // `executor.advance` writing the PrOpened event. After the budget
     // is exhausted with no resolution, we treat the PR as genuinely
     // untracked and 200 the delivery.
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
 
     let body = serde_json::to_vec(&json!({
@@ -161,7 +133,7 @@ async fn webhook_for_truly_untracked_pr_returns_200_after_retry_budget() {
 
 #[tokio::test]
 async fn webhook_with_bad_signature_returns_403() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
     let body = b"{}".to_vec();
     let req = Request::builder()
@@ -181,8 +153,8 @@ async fn webhook_returns_500_when_workflow_lookup_fails() {
     // Closing the pool forces the resolver query to fail. The handler
     // MUST surface this as 500 so GitHub retries — silently 200ing it
     // (the bug Codex flagged) would drop a real merge event.
-    let exec = fixture().await;
-    exec.storage().pool().close().await;
+    let (exec, _db) = fixture().await;
+    exec.storage().close().await;
     let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
 
     let body = serde_json::to_vec(&json!({
@@ -202,7 +174,7 @@ async fn webhook_returns_500_when_workflow_lookup_fails() {
 
 #[tokio::test]
 async fn webhook_for_pull_request_closed_without_merge_is_ignored() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     insert_pr_opened(exec.storage(), "wf-route-2", "octo", "world", 42).await;
     let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
 

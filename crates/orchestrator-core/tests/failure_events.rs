@@ -3,6 +3,7 @@
 //! failure and produce compensating events.
 
 use async_trait::async_trait;
+use orchestrator_core::test_support::fresh_storage;
 use orchestrator_core::*;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -114,7 +115,7 @@ async fn setup(
     Arc<AtomicUsize>,
     Arc<tokio::sync::Notify>,
 ) {
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
     let executor = Arc::new(Executor::new(storage, FailureTrackerReducer));
     let mut dispatcher = Dispatcher::new(
         executor.clone(),
@@ -283,7 +284,7 @@ async fn failure_event_advance_is_idempotent_via_dedup_key() {
     // Verify the dedup-key contract: writing the same failure event
     // command twice through executor.advance returns the prior outcome
     // on the second call, without producing a duplicate event.
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
     let executor = Executor::new(storage, FailureTrackerReducer);
     let workflow_id = WorkflowId::new("wf-dedup");
 
@@ -450,7 +451,7 @@ impl Sink for SideEventSink {
 
 #[tokio::test]
 async fn side_events_are_written_after_primary_outcome() {
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
+    let (storage, _db) = fresh_storage().await;
     let executor = Arc::new(Executor::new(storage, SideEventReducer));
     let mut dispatcher = Dispatcher::new(
         executor.clone(),

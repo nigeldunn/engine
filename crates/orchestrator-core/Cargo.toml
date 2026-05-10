@@ -3,13 +3,20 @@ name = "orchestrator-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Off by default. Enables the `test_support` module, which exposes
+# privileged helpers (per-test database harness, raw event/snapshot
+# inserts) that consumers' integration tests rely on. Production
+# binaries MUST NOT enable this feature.
+test-support = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "chrono", "json", "migrate"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +40,13 @@ tracing = "0.1"
 rand = "0.8"
 
 [dev-dependencies]
+# Self-reference pulls the `test-support` feature into the lib build
+# for integration tests. Without this, `cargo test -p orchestrator-core`
+# fails with E0432 because cfg(test) on the integration test binary
+# does not propagate to the linked lib — the lib is built without
+# --test, so the `cfg(any(test, feature = "test-support"))` gate hides
+# `test_support` from the integration test crates.
+orchestrator-core = { path = ".", features = ["test-support"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

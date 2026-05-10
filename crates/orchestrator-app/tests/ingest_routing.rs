@@ -7,15 +7,16 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use orchestrator_app::server::build_ingest_router;
 use orchestrator_coding_workflow::WorkflowReducer;
-use orchestrator_core::{Executor, Storage, WorkflowId};
+use orchestrator_core::test_support::{fresh_storage, DbGuard};
+use orchestrator_core::{Executor, WorkflowId};
 use serde_json::json;
 use tower::ServiceExt;
 
 const BEARER: &str = "secret-test-token";
 
-async fn fixture() -> Arc<Executor<WorkflowReducer>> {
-    let storage = Storage::open("sqlite::memory:").await.unwrap();
-    Arc::new(Executor::new(storage, WorkflowReducer))
+async fn fixture() -> (Arc<Executor<WorkflowReducer>>, DbGuard) {
+    let (storage, db) = fresh_storage().await;
+    (Arc::new(Executor::new(storage, WorkflowReducer)), db)
 }
 
 fn ticket_body(base_branch: &str) -> Vec<u8> {
@@ -42,7 +43,7 @@ fn post_request(token: Option<&str>, body: Vec<u8>) -> Request<Body> {
 
 #[tokio::test]
 async fn first_post_creates_workflow_and_returns_201() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_ingest_router(Some(BEARER.into()), exec.clone());
 
     let resp = router
@@ -67,7 +68,7 @@ async fn first_post_creates_workflow_and_returns_201() {
 
 #[tokio::test]
 async fn re_post_with_identical_payload_returns_200_already_exists() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_ingest_router(None, exec.clone()); // no auth — loopback
 
     let r1 = router
@@ -97,7 +98,7 @@ async fn re_post_with_identical_payload_returns_200_already_exists() {
 
 #[tokio::test]
 async fn re_post_with_conflicting_payload_returns_409() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_ingest_router(None, exec.clone());
 
     let r1 = router
@@ -129,7 +130,7 @@ async fn re_post_with_conflicting_payload_returns_409() {
 
 #[tokio::test]
 async fn missing_bearer_token_returns_401_when_auth_configured() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_ingest_router(Some(BEARER.into()), exec.clone());
 
     let resp = router
@@ -148,7 +149,7 @@ async fn missing_bearer_token_returns_401_when_auth_configured() {
 
 #[tokio::test]
 async fn wrong_bearer_token_returns_401() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_ingest_router(Some(BEARER.into()), exec.clone());
 
     let resp = router
@@ -160,7 +161,7 @@ async fn wrong_bearer_token_returns_401() {
 
 #[tokio::test]
 async fn malformed_json_returns_400() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_ingest_router(None, exec.clone());
 
     let req = Request::builder()
@@ -175,7 +176,7 @@ async fn malformed_json_returns_400() {
 
 #[tokio::test]
 async fn workflow_id_override_decouples_from_ticket_id() {
-    let exec = fixture().await;
+    let (exec, _db) = fixture().await;
     let router = build_ingest_router(None, exec.clone());
 
     let body = serde_json::to_vec(&json!({

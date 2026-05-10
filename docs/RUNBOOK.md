@@ -17,7 +17,7 @@ cargo build --release --bin orchestrator-app
 # 2. Configure (see "Configuration" below for the full schema)
 cat > orchestrator.toml <<'EOF'
 [storage]
-sqlite_path = "/var/lib/orchestrator/orch.sqlite"
+database_url = "postgres://orch:orch@localhost:5432/orch"
 
 [github]
 app_id = 12345
@@ -88,7 +88,7 @@ TOML file passed via `--config <PATH>`. **No implicit search path** —
 the path is required.
 
 Layered overlay: file → environment variables (prefix `ORCH_`,
-`__` as section separator). Example: `ORCH_STORAGE__SQLITE_PATH=/var/db.sqlite`.
+`__` as section separator). Example: `ORCH_STORAGE__DATABASE_URL=postgres://orch:orch@localhost:5432/orch`.
 
 Unknown fields are rejected at parse time — typos surface as a clean
 error, not a silent ignored value.
@@ -97,7 +97,7 @@ error, not a silent ignored value.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `sqlite_path` | path | required | SQLite database file. Relative paths resolve against the directory containing the config file (not the process cwd). The DB is created if missing. WAL mode is enabled automatically. |
+| `database_url` | string | required | Postgres connection URL (`postgres://user:pass@host:port/dbname`). The database itself must exist; migrations are applied automatically at startup. In production, override via `ORCH_STORAGE__DATABASE_URL` so credentials don't live in the config file. |
 
 ### `[github]`
 
@@ -244,9 +244,10 @@ orchestrator-app --config /path/to/config.toml ingest \
   --workflow-id manual:ENG-123#run-2       # optional override
 ```
 
-The CLI opens the configured SQLite directly — no running server
-needed. Safe concurrent with a running engine: SQLite WAL handles the
-writer contention and `Storage::advance` is transactional.
+The CLI opens the configured Postgres directly — no running server
+needed. Safe concurrent with a running engine: `Storage::advance` is
+transactional and Postgres serialises any contention through per-row
+locks.
 
 Exit codes:
 
@@ -276,7 +277,7 @@ The boot sequence is:
 
 1. Parse CLI, load config, validate.
 2. Initialize tracing (TTY-aware: pretty for terminal, JSON otherwise).
-3. Open SQLite (creates file if missing, applies schema, sets WAL).
+3. Open Postgres pool against `database_url`, run any pending migrations.
 4. Resolve every secret (PEM, webhook secret, bearer tokens) — fails
    loudly if any is unreadable or empty.
 5. Bind the webhook listener and the ingest listener — fails loudly if
@@ -387,8 +388,8 @@ Look at `sink_health` in the database. The `state`, `reason`, and
 
 ### The DB is down
 
-`sqlx`'s pool surfaces this as `BUSY` or connection errors. The
-webhook handler responds 500; ingest endpoints respond 500. The
+`sqlx`'s pool surfaces this as connection / acquire-timeout errors.
+The webhook handler responds 500; ingest endpoints respond 500. The
 dispatcher's claim cycle errors and backs off 2s before retrying.
 Once the DB is back, normal operation resumes.
 
@@ -404,8 +405,8 @@ A second writer was racing ours on the same `(workflow_id, sequence)`
 PK. The Executor retries automatically (with exponential backoff up
 to `max_retries`). If you see `RetryBudgetExhausted`, you have
 multiple processes writing to the same workflow — likely from
-running two `orchestrator-app` instances against the same SQLite. v1
-is single-instance; multi-process coordination is a deferred design
+running two `orchestrator-app` instances against the same database.
+v1 is single-instance; multi-process coordination is a deferred design
 question (see PLAN.md).
 
 ### A workflow halted with `Failed`; how do I recover?
@@ -438,7 +439,7 @@ Filter via `RUST_LOG`. Default: `info,orchestrator=debug`. Examples:
 RUST_LOG=debug orchestrator-app --config orch.toml
 
 # Quiet but keep SQL queries:
-RUST_LOG=warn,sqlx=debug orchestrator-app --config orch.toml
+RUST_LOG=warn,sqlx::query=debug orchestrator-app --config orch.toml
 ```
 
 `#[instrument]` is used liberally — span fields surface as JSON
@@ -448,34 +449,33 @@ attributes for correlation. Notable spans: `dispatcher::run`,
 
 ## Storage layout cheat sheet
 
-Six tables, all in SQLite, schema in
-`crates/orchestrator-core/src/schema.sql`:
+Six tables, all in Postgres. Schema lives in
+`crates/orchestrator-core/migrations/` and is applied automatically at
+`Storage::open` via `sqlx::migrate!`:
 
 | Table | What's in it | Operator queries |
 |---|---|---|
-| `events` | The append-only log. Everything that happened. | `SELECT payload_type, recorded_at FROM events WHERE workflow_id = ? ORDER BY sequence;` |
-| `snapshots` | Current state per workflow (cache). | `SELECT json_extract(state_blob, '$.status') FROM snapshots WHERE workflow_id = ?;` |
-| `actions_outbox` | Pending side effects. | `SELECT action_kind, state, attempt FROM actions_outbox WHERE workflow_id = ?;` |
-| `action_attempts` | Audit trail of dispatch attempts. | `SELECT * FROM action_attempts WHERE action_id = ? ORDER BY attempt;` |
+| `events` | The append-only log. Everything that happened. | `SELECT payload_type, recorded_at FROM events WHERE workflow_id = $1 ORDER BY sequence;` |
+| `snapshots` | Current state per workflow (cache). | `SELECT state_blob->>'status' FROM snapshots WHERE workflow_id = $1;` |
+| `actions_outbox` | Pending side effects. | `SELECT action_kind, state, attempt FROM actions_outbox WHERE workflow_id = $1;` |
+| `action_attempts` | Audit trail of dispatch attempts. | `SELECT * FROM action_attempts WHERE action_id = $1 ORDER BY attempt;` |
 | `sink_health` | Persisted sink status. | `SELECT * FROM sink_health WHERE state != 'healthy';` |
 | `workflow_configs` | Content-addressed config snapshots. | Mostly internal. |
 
-JSON payloads are TEXT — query with SQLite's `json_extract`.
+Payloads are JSONB — query with `payload->'field'` (returns `jsonb`)
+or `payload->>'field'` (returns `text`).
 
 ## Backups and DR
 
-Standard SQLite practice:
+Standard Postgres practice:
 
-- **Live backup**: use `sqlite3 orch.sqlite ".backup '/path/to/backup.sqlite'"`
-  (works concurrently with a running engine, takes a checkpoint).
-- **WAL files**: `*.sqlite-wal` and `*.sqlite-shm` should live alongside
-  the main file. Don't restore just the `.sqlite` without them — you'll
-  miss recent writes.
-- **Filesystem snapshots** (LVM, ZFS, etc.) are also fine for SQLite WAL.
-
-Restoring from backup is a clean swap. The engine on startup will
-replay any events the snapshot was missing (snapshots are a cache;
-event log is authoritative).
+- **Logical backup**: `pg_dump --format=custom orch > orch.dump` — runs
+  concurrently with a live engine, captures a consistent snapshot.
+- **Physical backup / PITR**: configure WAL archiving + base backups
+  (Aurora and most managed services do this for you).
+- **Restore**: `pg_restore --clean --if-exists -d orch orch.dump`. The
+  engine on startup will replay any events the snapshot was missing
+  (snapshots are a cache; event log is authoritative).
 
 ## Architecture quick reference
 
