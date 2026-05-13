@@ -1,11 +1,32 @@
 # AWS ECS Express and Aurora Serverless deployment plan
 
-> **Status (2026-05-10):** the application changes in §"Application
-> changes" are **complete** — the codebase is now Postgres-only and
-> ships with a `docker-compose.yml` for local development. This
-> document is preserved for the infrastructure / cost analysis
-> sections that drove the migration. Sections describing the SQLite
-> baseline are historical.
+> **Status (2026-05-13):** partial progress on the work in
+> §"Application changes":
+>
+> - **Storage backend + `[storage]` config:** complete. The codebase
+>   is Postgres-only; `docker-compose.yml` provides local dev; the
+>   env override is `ORCH_STORAGE__DATABASE_URL`.
+> - **DB pool tuning for Aurora auto-pause:** complete. The pool in
+>   `crates/orchestrator-core/src/storage.rs` uses `min_connections=0`,
+>   a 60s idle timeout, and a 30s acquire timeout to tolerate
+>   cold-resume latency.
+> - **Aurora idle behavior (event-driven dispatcher wakeups):** not
+>   done. `Dispatcher` still owns a single `Notify` used only for
+>   shutdown (`crates/orchestrator-core/src/dispatcher.rs`), so the
+>   default poll loop and the unconditional health-check loop keep
+>   Aurora warm regardless of incoming load.
+> - **Unified HTTP listener + `/healthz`:** not done.
+>   `crates/orchestrator-app/src/runtime.rs` still binds separate
+>   webhook and ingest listeners; no `/healthz` route exists in
+>   `crates/orchestrator-app/src/server.rs`. ECS health checks would
+>   need one.
+> - **Container and ECS artifacts:** not done. No Dockerfile or task
+>   definition in tree.
+>
+> The "Aurora mostly paused" scenarios in the cost table assume the
+> Aurora-idle and HTTP changes land. Without them, budget as though
+> Aurora stays at minimum active capacity. Sections describing the
+> SQLite baseline are kept for historical reference.
 
 Prepared: 2026-05-09
 Target work date: 2026-05-10
@@ -41,9 +62,9 @@ service unless the agent service becomes async and durable. The current
 agent contract expects synchronous `/run/{agent_type}` calls, while
 real coder work can take long enough to fight ALB/client timeouts.
 
-## Current app constraints
+## Pre-migration app constraints (historical)
 
-The current app assumes local SQLite in several important places:
+The app *previously* assumed local SQLite in several important places:
 
 - Config exposes `[storage].sqlite_path`, and runtime constructs a
   `sqlite:` URL directly.
@@ -90,23 +111,32 @@ transaction. In Postgres, prefer a single claim query using
 
 Replace or extend `[storage]`.
 
-Initial target:
+Target shape (in code as of 2026-05-10):
 
 ```toml
 [storage]
-database_url = { env = "ORCH_DATABASE_URL" }
-backend = "postgres"
+database_url = "postgres://orch:orch@localhost:5432/orch"
 ```
 
-Implementation notes:
+In production, set the URL via the environment so credentials never
+live in the TOML file or container image. Figment overlays `ORCH_`-
+prefixed env vars onto the config, with `__` as the section separator:
 
-- Keep `sqlite_path` available for local/dev mode if SQLite remains
-  supported.
+```sh
+ORCH_STORAGE__DATABASE_URL=postgres://USER:PASS@HOST:5432/orch
+```
+
+Operator notes:
+
 - Read production secrets from ECS task environment variables populated
   from Secrets Manager.
 - Do not put DB passwords in the config file or container image.
-- Set SQLx pool options deliberately: small max connections, zero or
-  low min connections, short idle timeout.
+- SQLx pool is already set up for Aurora auto-pause in
+  `crates/orchestrator-core/src/storage.rs`:
+  `max_connections=5`, `min_connections=0`, `idle_timeout=60s`,
+  `acquire_timeout=30s`. Further reductions (e.g. `max=3`,
+  `idle=15s`, `acquire=60s`) are an optimization, not a correctness
+  fix.
 
 ### Aurora idle behavior
 
@@ -167,17 +197,38 @@ have been tested under concurrent tasks.
 
 ## Implementation sequence
 
-1. Add Postgres dependencies and a second schema/migration path.
-2. Refactor `Storage` so SQLite and Postgres can share the public API.
-3. Port `advance`, event reads, action claiming, lease renewal,
-   finalization, failure recording, and sink health methods.
-4. Port app-level SQL in ingest and webhook lookup.
-5. Add Postgres integration tests using a disposable local Postgres.
-6. Add unified HTTP listener and `/healthz`.
-7. Add idle-friendly dispatcher wakeups and DB pool tuning.
-8. Add Dockerfile and ECS task/service config.
-9. Deploy to a dev ECS service with Aurora min 0 ACUs.
-10. Run crash recovery, webhook redelivery, and agent failure tests.
+Progress as of 2026-05-13. `(done)` is in code on `main`; `(todo)`
+remains for the personal-use deployment shape.
+
+1. `(done)` Add Postgres dependencies and a schema/migration path.
+2. `(done)` Refactor `Storage` so SQLite and Postgres share the
+   public API. (The final cut-over removed SQLite entirely — see
+   `CLAUDE.md` rule 9.)
+3. `(done)` Port `advance`, event reads, action claiming, lease
+   renewal, finalization, failure recording, and sink health methods.
+4. `(done)` Port app-level SQL in ingest and webhook lookup.
+5. `(done)` Add Postgres integration tests using a disposable local
+   Postgres.
+6. `(todo)` Add unified HTTP listener and `/healthz`. `/healthz`
+   must return 200 without touching Storage so ECS health checks do
+   not wake Aurora.
+7. `(partial)` Idle-friendly dispatcher behavior:
+   - `(done)` DB pool tuning at
+     `crates/orchestrator-core/src/storage.rs` (`max=5`, `min=0`,
+     `idle=60s`, `acquire=30s`).
+   - `(todo)` Wake-driven dispatcher loop: expose a wake `Notify`
+     alongside `shutdown_handle()` and fire it from the webhook
+     handler, the ingest handler, and after each successful
+     `executor.advance` inside the dispatcher. The existing
+     `poll_interval` becomes a fallback only.
+   - `(todo)` Stop the health-check loop from running
+     `list_unhealthy_sinks` every `health_check_interval` at idle —
+     gate it on a non-empty in-memory unhealthy-sink set.
+8. `(todo)` Add Dockerfile (ARM64, glibc, distroless) and ECS task /
+   service config.
+9. `(todo)` Deploy to a dev ECS service with Aurora min 0 ACUs.
+10. `(todo)` Run crash recovery, webhook redelivery, and agent
+    failure tests against the deployed service.
 
 ## Test checklist
 
@@ -240,8 +291,9 @@ Cost interpretation:
 
 ## Open decisions for tomorrow
 
-- Keep SQLite as a supported local backend, or cut over fully to
-  Postgres?
+- ~~Keep SQLite as a supported local backend, or cut over fully to
+  Postgres?~~ Decided 2026-05-10: full Postgres cut-over. SQLite is
+  removed from the codebase.
 - Use direct Aurora connections first, or add RDS Proxy? Direct is
   cheaper and allows auto-pause. RDS Proxy keeps connections open and
   can prevent auto-pause.

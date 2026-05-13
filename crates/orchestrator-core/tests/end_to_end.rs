@@ -228,6 +228,81 @@ async fn happy_path_increment_to_done() {
     shutdown.notify_one();
 }
 
+/// Stage-A guard: an external producer firing `wake_handle().notify_one()`
+/// must short-circuit the `poll_interval` sleep, so an action lands on the
+/// sink well before the next scheduled poll would even fire. If the wake
+/// arm is ever removed from `Dispatcher::run`'s `select!`, this test fails
+/// in ~10s instead of passing in ~100ms — which is the whole point: the
+/// existing tests use a 50ms poll and would pass even without wake.
+#[tokio::test]
+async fn external_wake_claims_before_next_poll() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (storage, _db) = fresh_storage().await;
+    let executor = Arc::new(Executor::new(storage, CounterReducer));
+
+    // Poll deliberately set far above the assertion deadline below.
+    // Without wake, a claim cycle would not run until 10s elapsed.
+    let long_poll = Duration::from_secs(10);
+    let mut dispatcher = Dispatcher::new(
+        executor.clone(),
+        DispatcherConfig {
+            poll_interval: long_poll,
+            lease_duration: Duration::from_secs(30),
+            health_check_interval: Duration::from_secs(60),
+            sink_unhealthy_retry_delay: Duration::from_millis(100),
+            ..Default::default()
+        },
+    );
+    let (sink, handles) = CountingSink::new_with_handles("test-sink");
+    dispatcher.register(sink);
+    let shutdown = dispatcher.shutdown_handle();
+    let wake = dispatcher.wake_handle();
+    tokio::spawn(dispatcher.run());
+
+    let workflow_id = WorkflowId::new("wf-wake");
+    executor
+        .advance(EventCommand {
+            workflow_id: workflow_id.clone(),
+            payload_type: "increment.v1".into(),
+            payload_schema_version: 1,
+            payload: json!({}),
+            causation: Causation::External {
+                source: "test".into(),
+                request_id: "req-wake".into(),
+            },
+            trace_id: None,
+            ingress_dedup_key: Some("req-wake".into()),
+        })
+        .await
+        .unwrap();
+    // Mirror what the HTTP handlers do after a successful advance.
+    // `notify_one` is safe to call before any consumer has registered —
+    // `Notify` stores up to one permit, which the next `notified().await`
+    // consumes immediately.
+    wake.notify_one();
+
+    // 1s deadline gives generous headroom for a fresh-DB Postgres
+    // round-trip; still ~10x below `long_poll`, so a missing wake arm
+    // fails the test fast rather than waiting out the poll.
+    let start = std::time::Instant::now();
+    let deadline = start + Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        if handles.invocations.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let invocations = handles.invocations.load(Ordering::SeqCst);
+    let elapsed = start.elapsed();
+    assert!(
+        invocations >= 1,
+        "wake should have triggered a claim cycle within 1s; \
+         invocations={invocations} after {elapsed:?} (poll_interval={long_poll:?})"
+    );
+
+    shutdown.notify_one();
+}
+
 #[tokio::test]
 async fn ingress_dedup_returns_prior_outcome() {
     let _ = tracing_subscriber::fmt::try_init();

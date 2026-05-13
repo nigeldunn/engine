@@ -15,6 +15,7 @@ use orchestrator_core::test_support::{fresh_storage, DbGuard};
 use orchestrator_core::{Executor, WorkflowId};
 use serde_json::json;
 use sha2::Sha256;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -61,7 +62,7 @@ async fn signed_pull_request_merged_webhook_appends_pr_merged_event() {
     let (exec, _db) = fixture().await;
     insert_pr_opened(exec.storage(), "wf-route-1", "octo", "world", 42).await;
 
-    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
+    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF, Arc::new(Notify::new()));
 
     let body = serde_json::to_vec(&json!({
         "action": "closed",
@@ -94,6 +95,70 @@ async fn signed_pull_request_merged_webhook_appends_pr_merged_event() {
     );
 }
 
+/// Stage-A wake contract at the HTTP boundary: a successful PR-merged
+/// delivery must fire `wake.notify_one()` (so the dispatcher claims the
+/// reducer-derived next action without waiting out `poll_interval`); an
+/// ignored delivery (closed-without-merge) must NOT fire wake — no event
+/// was written. Codex Stage-A re-review WARN: the dispatcher-level
+/// latency test in `orchestrator-core` only proves the select! reacts to
+/// a wake — it doesn't exercise the production handler closure.
+#[tokio::test]
+async fn webhook_handler_fires_wake_on_merged_but_not_on_ignored() {
+    let (exec, _db) = fixture().await;
+    insert_pr_opened(exec.storage(), "wf-route-wake", "octo", "world", 7).await;
+
+    let wake = Arc::new(Notify::new());
+    let router = build_webhook_router(
+        SECRET.into(),
+        exec.clone(),
+        TEST_BUDGET,
+        TEST_BACKOFF,
+        wake.clone(),
+    );
+
+    // Merged delivery → handler writes PrMerged + must fire wake.
+    let merged_body = serde_json::to_vec(&json!({
+        "action": "closed",
+        "pull_request": {
+            "number": 7,
+            "merged": true,
+            "merge_commit_sha": "feedfacefeedfacefeedfacefeedfacefeedface",
+        },
+        "repository": { "owner": { "login": "octo" }, "name": "world" },
+    }))
+    .unwrap();
+    let req = signed_post(SECRET, "pull_request", "delivery-wake-merged", merged_body);
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // notify_one fires synchronously inside the handler closure before the
+    // 200 is returned, so a permit is already stored by the time we poll.
+    tokio::time::timeout(Duration::from_millis(50), wake.notified())
+        .await
+        .expect("merged delivery must store a wake permit");
+
+    // Closed-but-not-merged delivery is HandleDeliveryError::Ignored —
+    // no event written, no wake. Permit consumed above, so an additional
+    // notify would unblock the next `notified()`; assert the opposite.
+    let ignored_body = serde_json::to_vec(&json!({
+        "action": "closed",
+        "pull_request": {
+            "number": 7,
+            "merged": false,
+        },
+        "repository": { "owner": { "login": "octo" }, "name": "world" },
+    }))
+    .unwrap();
+    let req = signed_post(SECRET, "pull_request", "delivery-wake-ignored", ignored_body);
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let res = tokio::time::timeout(Duration::from_millis(50), wake.notified()).await;
+    assert!(
+        res.is_err(),
+        "ignored delivery must NOT fire wake (no event was written)"
+    );
+}
+
 #[tokio::test]
 async fn webhook_for_truly_untracked_pr_returns_200_after_retry_budget() {
     // Codex stop-gate round-9: GitHub does NOT auto-retry failed
@@ -106,7 +171,7 @@ async fn webhook_for_truly_untracked_pr_returns_200_after_retry_budget() {
     // is exhausted with no resolution, we treat the PR as genuinely
     // untracked and 200 the delivery.
     let (exec, _db) = fixture().await;
-    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
+    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF, Arc::new(Notify::new()));
 
     let body = serde_json::to_vec(&json!({
         "action": "closed",
@@ -134,7 +199,7 @@ async fn webhook_for_truly_untracked_pr_returns_200_after_retry_budget() {
 #[tokio::test]
 async fn webhook_with_bad_signature_returns_403() {
     let (exec, _db) = fixture().await;
-    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
+    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF, Arc::new(Notify::new()));
     let body = b"{}".to_vec();
     let req = Request::builder()
         .uri("/")
@@ -155,7 +220,7 @@ async fn webhook_returns_500_when_workflow_lookup_fails() {
     // (the bug Codex flagged) would drop a real merge event.
     let (exec, _db) = fixture().await;
     exec.storage().close().await;
-    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
+    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF, Arc::new(Notify::new()));
 
     let body = serde_json::to_vec(&json!({
         "action": "closed",
@@ -176,7 +241,7 @@ async fn webhook_returns_500_when_workflow_lookup_fails() {
 async fn webhook_for_pull_request_closed_without_merge_is_ignored() {
     let (exec, _db) = fixture().await;
     insert_pr_opened(exec.storage(), "wf-route-2", "octo", "world", 42).await;
-    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF);
+    let router = build_webhook_router(SECRET.into(), exec.clone(), TEST_BUDGET, TEST_BACKOFF, Arc::new(Notify::new()));
 
     let body = serde_json::to_vec(&json!({
         "action": "closed",

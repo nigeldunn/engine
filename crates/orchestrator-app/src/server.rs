@@ -47,8 +47,18 @@ pub async fn bind_webhook_listener(listen: SocketAddr) -> Result<TcpListener, Se
 
 /// Run the webhook server on an already-bound listener until `shutdown`
 /// fires. Errors during a single delivery do NOT take the server down —
-/// they're mapped to HTTP responses or logged.
-#[instrument(skip(listener, executor, secret, shutdown), fields(prefix = %path_prefix))]
+/// they're mapped to HTTP responses or logged. `wake` is the dispatcher's
+/// wake handle: every successful delivery fires `notify_one()` so a fresh
+/// event is claimed without waiting for the next poll cycle (Aurora idle
+/// behavior: see `docs/AWS_ECS_AURORA_DEPLOYMENT.md`).
+// Two `Arc<Notify>` parameters (`wake` and `shutdown`) are distinct
+// concerns and intentionally kept separate — coalescing them would
+// reintroduce the multi-consumer waker race the dispatcher already
+// fixed. The retry budget + backoff are also distinct knobs, so a
+// `RetryPolicy` wrapper would just hide them. Localized allow is
+// cheaper than the abstractions.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(listener, executor, secret, wake, shutdown), fields(prefix = %path_prefix))]
 pub async fn run_webhook(
     listener: TcpListener,
     path_prefix: String,
@@ -56,10 +66,16 @@ pub async fn run_webhook(
     executor: Arc<Executor<WorkflowReducer>>,
     lookup_retry_budget: Duration,
     lookup_retry_backoff: Duration,
+    wake: Arc<Notify>,
     shutdown: Arc<Notify>,
 ) -> Result<(), ServerError> {
-    let inner =
-        build_webhook_router(secret, executor, lookup_retry_budget, lookup_retry_backoff);
+    let inner = build_webhook_router(
+        secret,
+        executor,
+        lookup_retry_budget,
+        lookup_retry_backoff,
+        wake,
+    );
     let router = if path_prefix.is_empty() || path_prefix == "/" {
         inner
     } else {
@@ -84,15 +100,23 @@ pub async fn run_webhook(
 /// tests can drive the router via `tower::ServiceExt::oneshot` without
 /// binding a port. Tests pass small budgets to avoid sleeping through
 /// the production 5-second budget.
+///
+/// `wake` is fired exactly once per successfully-advanced delivery so the
+/// dispatcher's claim loop picks up reducer-derived actions without
+/// waiting for the next `poll_interval` tick. The same handle is shared
+/// across deliveries; concurrent calls are safe (`Notify::notify_one` is
+/// idempotent — at most one permit is stored).
 pub fn build_webhook_router(
     secret: String,
     executor: Arc<Executor<WorkflowReducer>>,
     lookup_retry_budget: Duration,
     lookup_retry_backoff: Duration,
+    wake: Arc<Notify>,
 ) -> axum::Router {
     let config = GithubWebhookConfig::new(secret);
     webhook_router(config, move |delivery| {
         let executor = executor.clone();
+        let wake = wake.clone();
         async move {
             match handle_delivery_with_budget(
                 &executor,
@@ -102,7 +126,10 @@ pub fn build_webhook_router(
             )
             .await
             {
-                Ok(()) => Ok::<(), String>(()),
+                Ok(()) => {
+                    wake.notify_one();
+                    Ok::<(), String>(())
+                }
                 Err(HandleDeliveryError::Ignored) => {
                     // Common for non-merged closes / unrelated events;
                     // debug-level so it doesn't drown the logs.
@@ -174,15 +201,19 @@ pub async fn bind_ingest_listener(listen: SocketAddr) -> Result<TcpListener, Ser
 /// Run the ticket-ingest server on an already-bound listener until
 /// `shutdown` fires. `bearer_token` is the resolved value (or None on
 /// loopback-only deployments). Auth is enforced uniformly for every
-/// endpoint when set.
-#[instrument(skip(listener, executor, bearer_token, shutdown))]
+/// endpoint when set. `wake` is the dispatcher's wake handle: every
+/// `Created` ingest fires `notify_one()` so a new workflow's first
+/// derived action is claimed without waiting for `poll_interval` (Aurora
+/// idle behavior).
+#[instrument(skip(listener, executor, bearer_token, wake, shutdown))]
 pub async fn run_ingest(
     listener: TcpListener,
     bearer_token: Option<String>,
     executor: Arc<Executor<WorkflowReducer>>,
+    wake: Arc<Notify>,
     shutdown: Arc<Notify>,
 ) -> Result<(), ServerError> {
-    let router = build_ingest_router(bearer_token, executor);
+    let router = build_ingest_router(bearer_token, executor, wake);
     info!("ingest server listening");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -201,6 +232,11 @@ pub async fn run_ingest(
 struct IngestState {
     executor: Arc<Executor<WorkflowReducer>>,
     bearer_token: Option<Arc<String>>,
+    /// Dispatcher wake — fired after a successful `Created` ingest so the
+    /// dispatcher doesn't wait out `poll_interval` before claiming the new
+    /// workflow's first action. `AlreadyExists` does not wake (no new event
+    /// was written).
+    wake: Arc<Notify>,
 }
 
 /// Construct the `POST /tickets` router. Exposed so tests can drive it
@@ -208,10 +244,12 @@ struct IngestState {
 pub fn build_ingest_router(
     bearer_token: Option<String>,
     executor: Arc<Executor<WorkflowReducer>>,
+    wake: Arc<Notify>,
 ) -> Router {
     let state = IngestState {
         executor,
         bearer_token: bearer_token.map(Arc::new),
+        wake,
     };
     Router::new()
         .route("/tickets", post(handle_ingest))
@@ -245,14 +283,17 @@ async fn handle_ingest(
     };
 
     match ingest_ticket(&state.executor, request).await {
-        Ok(IngestOutcome::Created { workflow_id }) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "workflow_id": workflow_id.as_str(),
-                "status": "created",
-            })),
-        )
-            .into_response(),
+        Ok(IngestOutcome::Created { workflow_id }) => {
+            state.wake.notify_one();
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "workflow_id": workflow_id.as_str(),
+                    "status": "created",
+                })),
+            )
+                .into_response()
+        }
         Ok(IngestOutcome::AlreadyExists { workflow_id }) => (
             StatusCode::OK,
             Json(serde_json::json!({

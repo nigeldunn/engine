@@ -10,6 +10,7 @@ use orchestrator_coding_workflow::WorkflowReducer;
 use orchestrator_core::test_support::{fresh_storage, DbGuard};
 use orchestrator_core::{Executor, WorkflowId};
 use serde_json::json;
+use tokio::sync::Notify;
 use tower::ServiceExt;
 
 const BEARER: &str = "secret-test-token";
@@ -44,7 +45,7 @@ fn post_request(token: Option<&str>, body: Vec<u8>) -> Request<Body> {
 #[tokio::test]
 async fn first_post_creates_workflow_and_returns_201() {
     let (exec, _db) = fixture().await;
-    let router = build_ingest_router(Some(BEARER.into()), exec.clone());
+    let router = build_ingest_router(Some(BEARER.into()), exec.clone(), Arc::new(Notify::new()));
 
     let resp = router
         .oneshot(post_request(Some(BEARER), ticket_body("main")))
@@ -69,7 +70,7 @@ async fn first_post_creates_workflow_and_returns_201() {
 #[tokio::test]
 async fn re_post_with_identical_payload_returns_200_already_exists() {
     let (exec, _db) = fixture().await;
-    let router = build_ingest_router(None, exec.clone()); // no auth — loopback
+    let router = build_ingest_router(None, exec.clone(), Arc::new(Notify::new())); // no auth — loopback
 
     let r1 = router
         .clone()
@@ -96,10 +97,54 @@ async fn re_post_with_identical_payload_returns_200_already_exists() {
     assert_eq!(events.len(), 1);
 }
 
+/// Stage-A wake contract at the HTTP boundary: `Created` ingests must
+/// fire `wake.notify_one()` so the dispatcher claims without waiting out
+/// `poll_interval`; `AlreadyExists` (no event written) must NOT fire wake.
+/// Codex Stage-A re-review WARN: the latency test in `orchestrator-core`
+/// only proves the dispatcher's select! reacts to a wake — it doesn't
+/// exercise the production handler closure. This test closes that gap.
+#[tokio::test]
+async fn ingest_handler_fires_wake_on_created_but_not_already_exists() {
+    use std::time::Duration;
+    let (exec, _db) = fixture().await;
+    let wake = Arc::new(Notify::new());
+    let router = build_ingest_router(None, exec.clone(), wake.clone());
+
+    // First POST returns 201 Created — handler must store a wake permit.
+    let r1 = router
+        .clone()
+        .oneshot(post_request(None, ticket_body("main")))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::CREATED);
+
+    // The handler calls `notify_one` synchronously before returning, so
+    // by the time we observe the 201 a permit is already stored. A short
+    // timeout is enough; we just want to fail fast if wake was missed.
+    tokio::time::timeout(Duration::from_millis(50), wake.notified())
+        .await
+        .expect("Created ingest must store a wake permit");
+
+    // Re-POST returns 200 AlreadyExists — no event written, no wake. We
+    // just consumed the prior permit, so any new permit would unblock
+    // the next `notified()` immediately. Assert the opposite: it times
+    // out, proving the handler did NOT fire wake on the dedup path.
+    let r2 = router
+        .oneshot(post_request(None, ticket_body("main")))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let res = tokio::time::timeout(Duration::from_millis(50), wake.notified()).await;
+    assert!(
+        res.is_err(),
+        "AlreadyExists must NOT fire wake (no event was written)"
+    );
+}
+
 #[tokio::test]
 async fn re_post_with_conflicting_payload_returns_409() {
     let (exec, _db) = fixture().await;
-    let router = build_ingest_router(None, exec.clone());
+    let router = build_ingest_router(None, exec.clone(), Arc::new(Notify::new()));
 
     let r1 = router
         .clone()
@@ -131,7 +176,7 @@ async fn re_post_with_conflicting_payload_returns_409() {
 #[tokio::test]
 async fn missing_bearer_token_returns_401_when_auth_configured() {
     let (exec, _db) = fixture().await;
-    let router = build_ingest_router(Some(BEARER.into()), exec.clone());
+    let router = build_ingest_router(Some(BEARER.into()), exec.clone(), Arc::new(Notify::new()));
 
     let resp = router
         .oneshot(post_request(None, ticket_body("main")))
@@ -150,7 +195,7 @@ async fn missing_bearer_token_returns_401_when_auth_configured() {
 #[tokio::test]
 async fn wrong_bearer_token_returns_401() {
     let (exec, _db) = fixture().await;
-    let router = build_ingest_router(Some(BEARER.into()), exec.clone());
+    let router = build_ingest_router(Some(BEARER.into()), exec.clone(), Arc::new(Notify::new()));
 
     let resp = router
         .oneshot(post_request(Some("wrong-token"), ticket_body("main")))
@@ -162,7 +207,7 @@ async fn wrong_bearer_token_returns_401() {
 #[tokio::test]
 async fn malformed_json_returns_400() {
     let (exec, _db) = fixture().await;
-    let router = build_ingest_router(None, exec.clone());
+    let router = build_ingest_router(None, exec.clone(), Arc::new(Notify::new()));
 
     let req = Request::builder()
         .method("POST")
@@ -177,7 +222,7 @@ async fn malformed_json_returns_400() {
 #[tokio::test]
 async fn workflow_id_override_decouples_from_ticket_id() {
     let (exec, _db) = fixture().await;
-    let router = build_ingest_router(None, exec.clone());
+    let router = build_ingest_router(None, exec.clone(), Arc::new(Notify::new()));
 
     let body = serde_json::to_vec(&json!({
         "ticket": { "source": "manual", "id": "ENG-123" },

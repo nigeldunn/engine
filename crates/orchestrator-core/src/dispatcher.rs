@@ -66,6 +66,18 @@ pub struct Dispatcher<R: Reducer> {
     extractors: Vec<Arc<dyn HintExtractor>>,
     config: DispatcherConfig,
     shutdown: Arc<Notify>,
+    /// Wake signal for the main claim loop. Distinct from `shutdown` so a
+    /// wake permit does not race with a shutdown notify on the same Notify.
+    /// Fired by:
+    ///   - HTTP-created work (webhook handler, ingest handler) so a fresh
+    ///     event lands in the dispatcher's claim window without waiting
+    ///     for `poll_interval`.
+    ///   - The dispatcher's own action-handling tasks on completion, so a
+    ///     reducer-derived follow-up action is claimed immediately.
+    ///
+    /// Single-consumer (only the main `run` loop waits on it), so
+    /// `notify_one()` is sufficient — no waiter-broadcast dance is needed.
+    wake: Arc<Notify>,
 }
 
 impl<R: Reducer> Dispatcher<R> {
@@ -78,6 +90,7 @@ impl<R: Reducer> Dispatcher<R> {
             extractors: Vec::new(),
             config,
             shutdown: Arc::new(Notify::new()),
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -110,6 +123,15 @@ impl<R: Reducer> Dispatcher<R> {
         self.shutdown.clone()
     }
 
+    /// Wake handle for HTTP servers and other in-process producers. Calling
+    /// `notify_one()` on the returned `Arc<Notify>` interrupts the main claim
+    /// loop's `poll_interval` sleep, so new events written via
+    /// `executor.advance` are picked up without waiting up to a full
+    /// poll cycle. Safe to clone and share across tasks.
+    pub fn wake_handle(&self) -> Arc<Notify> {
+        self.wake.clone()
+    }
+
     /// Run the dispatcher loop until shutdown.
     #[instrument(skip(self), fields(dispatcher = %self.id))]
     pub async fn run(self) -> Result<(), DispatcherError> {
@@ -134,6 +156,12 @@ impl<R: Reducer> Dispatcher<R> {
             handles.retain(|h| !h.is_finished());
 
             tokio::select! {
+                // `biased;` checks branches in declaration order, so a
+                // shutdown notify always wins when racing a pending wake
+                // permit. Without it, `select!`'s random choice can let
+                // one more claim cycle leak through after shutdown was
+                // signaled (Codex Stage-A nit #5).
+                biased;
                 _ = self.shutdown.notified() => {
                     // The caller's `notify_one()` only woke ONE of the two
                     // waiters on this Notify (main loop + health loop).
@@ -152,6 +180,11 @@ impl<R: Reducer> Dispatcher<R> {
                     let _ = health_handle.await;
                     info!(dispatcher = %self.id, "dispatcher stopped");
                     return Ok(());
+                }
+                _ = self.wake.notified() => {
+                    // A producer (HTTP handler or completed action task)
+                    // signaled new work — fall through and try to claim
+                    // without burning the rest of the `poll_interval`.
                 }
                 _ = sleep(self.config.poll_interval) => {}
             }
@@ -209,6 +242,7 @@ impl<R: Reducer> Dispatcher<R> {
                 let dispatcher_id = self.id.clone();
                 let lease = self.config.lease_duration;
                 let unhealthy_delay = self.config.sink_unhealthy_retry_delay;
+                let wake = self.wake.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
@@ -224,6 +258,13 @@ impl<R: Reducer> Dispatcher<R> {
                     {
                         error!(error = %e, "action handling failed");
                     }
+                    // Self-wake: a completed action may have produced a
+                    // reducer-derived follow-up. Fire unconditionally so a
+                    // chain of dependent actions drains without waiting
+                    // out a full `poll_interval` between each hop. Wakes
+                    // after failure paths are harmless — the next claim
+                    // either finds new work or no-ops.
+                    wake.notify_one();
                 });
                 handles.push(handle);
             }

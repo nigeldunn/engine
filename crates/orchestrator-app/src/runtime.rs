@@ -218,6 +218,10 @@ impl Runtime {
         dispatcher.register(AgentRunnerSink::new(agent_client));
 
         let dispatcher_shutdown = dispatcher.shutdown_handle();
+        // Capture wake handle BEFORE `dispatcher.run()` consumes self; HTTP
+        // servers below clone it to skip `poll_interval` whenever a fresh
+        // event lands.
+        let dispatcher_wake = dispatcher.wake_handle();
         let dispatcher = SubsystemHandle::new(
             "dispatcher",
             dispatcher_shutdown,
@@ -229,6 +233,7 @@ impl Runtime {
             let prefix = cfg.server.webhook.path_prefix.clone();
             let executor = executor.clone();
             let shutdown = webhook_shutdown.clone();
+            let wake = dispatcher_wake.clone();
             let retry_budget =
                 Duration::from_millis(cfg.server.webhook.lookup_retry_budget_ms);
             let retry_backoff =
@@ -241,6 +246,7 @@ impl Runtime {
                     executor,
                     retry_budget,
                     retry_backoff,
+                    wake,
                     shutdown,
                 )
                 .await
@@ -253,9 +259,16 @@ impl Runtime {
         let ingest_join = {
             let executor = executor.clone();
             let shutdown = ingest_shutdown.clone();
+            let wake = dispatcher_wake.clone();
             tokio::spawn(async move {
-                server::run_ingest(ingest_listener, ingest_bearer_token, executor, shutdown)
-                    .await
+                server::run_ingest(
+                    ingest_listener,
+                    ingest_bearer_token,
+                    executor,
+                    wake,
+                    shutdown,
+                )
+                .await
             })
         };
         let ingest_server =
