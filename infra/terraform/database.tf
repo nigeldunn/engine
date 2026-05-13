@@ -63,3 +63,22 @@ resource "aws_rds_cluster_instance" "writer" {
   engine_version      = aws_rds_cluster.this.engine_version
   publicly_accessible = false
 }
+
+# Fully-constructed Postgres connection URL. Stored as a separate secret
+# (rather than reconstructed at task-start time) so the ECS task
+# definition can pull it directly into `ORCH_STORAGE__DATABASE_URL`.
+# The password's character class is restricted to alphanumeric
+# (`random_password.db.special = false`) so the URL needs no escaping.
+locals {
+  database_url = "postgres://${aws_rds_cluster.this.master_username}:${random_password.db.result}@${aws_rds_cluster.this.endpoint}:${aws_rds_cluster.this.port}/${aws_rds_cluster.this.database_name}"
+}
+
+resource "aws_secretsmanager_secret" "database_url" {
+  name        = "${local.name}/database-url"
+  description = "Constructed Postgres connection URL for orchestrator-app"
+}
+
+resource "aws_secretsmanager_secret_version" "database_url" {
+  secret_id     = aws_secretsmanager_secret.database_url.id
+  secret_string = local.database_url
+}

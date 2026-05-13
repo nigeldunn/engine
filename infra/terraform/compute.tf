@@ -60,6 +60,7 @@ data "aws_iam_policy_document" "secrets_read" {
     actions = ["secretsmanager:GetSecretValue"]
     resources = [
       aws_secretsmanager_secret.db_password.arn,
+      aws_secretsmanager_secret.database_url.arn,
       aws_secretsmanager_secret.github_app_pem.arn,
       aws_secretsmanager_secret.github_webhook_secret.arn,
       aws_secretsmanager_secret.agent_bearer_token.arn,
@@ -84,12 +85,6 @@ resource "aws_iam_role" "task" {
 }
 
 # ── Task definition ─────────────────────────────────────────────────
-
-locals {
-  # Build the DB URL once. Aurora's cluster endpoint is the writer; we
-  # only have one instance so reads and writes both go here.
-  database_url = "postgres://${aws_rds_cluster.this.master_username}:%s@${aws_rds_cluster.this.endpoint}:${aws_rds_cluster.this.port}/${aws_rds_cluster.this.database_name}"
-}
 
 resource "aws_ecs_task_definition" "orch" {
   family                   = local.name
@@ -117,11 +112,17 @@ resource "aws_ecs_task_definition" "orch" {
     }]
 
     # Inject secrets as env vars that match the figment config schema
-    # (prefix ORCH_, double-underscore as section separator). The base
-    # config file (mounted or baked into the image) carries everything
-    # else; these overlays let production secrets stay in Secrets
-    # Manager rather than the config / image.
+    # (prefix ORCH_, double-underscore as section separator). The
+    # baked-in `orchestrator.toml` (Stage F gap-a fix: ships at
+    # /etc/orchestrator.toml in the image) carries structural fields
+    # with placeholder values; these env vars override every secret +
+    # the database URL so nothing sensitive lives in the image or in
+    # plain task-definition state.
     secrets = [
+      {
+        name      = "ORCH_STORAGE__DATABASE_URL"
+        valueFrom = aws_secretsmanager_secret.database_url.arn
+      },
       {
         name      = "ORCH_GITHUB__PRIVATE_KEY__INLINE"
         valueFrom = aws_secretsmanager_secret.github_app_pem.arn
@@ -141,18 +142,21 @@ resource "aws_ecs_task_definition" "orch" {
     ]
 
     environment = [
-      # Postgres URL is built from cluster endpoint + the secrets-managed
-      # password. ECS doesn't support string interpolation across
-      # `secrets` and `environment`, so the password slot is injected
-      # separately and the container is expected to render the URL at
-      # startup. For personal-use we inline the URL with a placeholder
-      # and rely on the operator overriding via Secrets Manager. Easier:
-      # operators set ORCH_STORAGE__DATABASE_URL directly via a secret
-      # stored at deploy time. The terraform-rendered placeholder below
-      # documents the host/db so the operator can construct the URL.
+      # Non-secret overrides that vary per deployment. github.app_id,
+      # install_id, and the agent service base URL are deployment
+      # identity, not secrets, so they live as terraform variables and
+      # plain env vars (visible in task definition state).
       {
-        name  = "ORCH_STORAGE__DATABASE_URL_TEMPLATE"
-        value = format(local.database_url, "REDACTED")
+        name  = "ORCH_GITHUB__APP_ID"
+        value = tostring(var.github_app_id)
+      },
+      {
+        name  = "ORCH_GITHUB__INSTALL_ID"
+        value = tostring(var.github_install_id)
+      },
+      {
+        name  = "ORCH_AGENT_RUNNER__BASE_URL"
+        value = var.agent_runner_base_url
       },
       {
         name  = "RUST_LOG"

@@ -1,0 +1,62 @@
+# Baseline orchestrator-app config for the Stage F Docker image.
+# COPY'd into the runtime stage at /etc/orchestrator.toml.
+#
+# Every secret or deployment-identity field is a PLACEHOLDER here and
+# is overridden at task-start time by ECS env vars defined in
+# `infra/terraform/compute.tf` (prefix `ORCH_`, double-underscore as
+# section separator). Editing this file requires rebuilding the image
+# and rolling the task; operator-mutable values belong in env vars or
+# Secrets Manager, not here.
+#
+# Placeholder strings are deliberately non-empty so the config-load
+# validator (which rejects empty inline secrets) doesn't fire before
+# the env overrides land — the engine sees the overridden values, not
+# the placeholders.
+
+[storage]
+# Overridden by Secrets Manager → ORCH_STORAGE__DATABASE_URL.
+database_url = "postgres://placeholder"
+
+[github]
+# Overridden by ORCH_GITHUB__APP_ID / __INSTALL_ID (terraform vars).
+app_id = 0
+install_id = 0
+# Overridden by Secrets Manager → ORCH_GITHUB__PRIVATE_KEY__INLINE.
+private_key = { inline = "placeholder" }
+# Overridden by Secrets Manager → ORCH_GITHUB__WEBHOOK_SECRET__INLINE.
+webhook_secret = { inline = "placeholder" }
+
+[agent_runner]
+# Overridden by ORCH_AGENT_RUNNER__BASE_URL (terraform var).
+base_url = "http://agent-svc.invalid:8080"
+# Overridden by Secrets Manager → ORCH_AGENT_RUNNER__BEARER_TOKEN__INLINE.
+# Field is declared here so the env override has a target structure to
+# land on (figment overlays values, it does not create new branches).
+bearer_token = { inline = "placeholder" }
+
+[server.webhook]
+# Bind 0.0.0.0 so Cloud Map / VPC Link can reach the listener inside
+# the awsvpc network namespace.
+listen = "0.0.0.0:8080"
+
+[server.ingest]
+# Loopback-only in the Stage F deploy. The ingest endpoint is reached
+# via `orchestrator-app ingest` exec'd inside the container, or by
+# binding 0.0.0.0 + adding an API Gateway route + bearer token (out
+# of scope for the initial deploy).
+listen = "127.0.0.1:8081"
+# Same structural-placeholder rationale as agent_runner.bearer_token.
+bearer_token = { inline = "placeholder" }
+
+[dispatcher]
+# Long fallback poll. Stage A's wake-driven path (commit 428322d)
+# means the main loop almost never waits this out — it's the upper
+# bound on dispatcher latency for actions enqueued via the CLI (no
+# in-process wake) or by an external producer the wake plumbing does
+# not cover.
+poll_interval_ms = 60000
+# Gap between probes of an already-unhealthy sink. Stage B (commit
+# 0515353) gates the loop on a non-empty cache, so this interval only
+# applies when something is actually unhealthy.
+health_check_interval_ms = 30000
+unhealthy_retry_interval_ms = 5000

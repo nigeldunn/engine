@@ -59,22 +59,13 @@ aws secretsmanager put-secret-value --secret-id orch/agent-bearer-token \
 aws secretsmanager put-secret-value --secret-id orch/ingest-bearer-token \
   --secret-string "<your ingest token>"
 
-# 5. Construct ORCH_STORAGE__DATABASE_URL and put it in a secret that
-#    the task definition references. (Not auto-generated because the
-#    URL embeds the password retrieved from db_password_secret_arn.)
-DB_PASS=$(aws secretsmanager get-secret-value \
-  --secret-id "$(terraform output -raw db_password_secret_arn)" \
-  --query SecretString --output text)
-HOST=$(terraform output -raw aurora_writer_endpoint)
-DB=$(terraform output -raw aurora_database)
-DB_URL="postgres://orch:${DB_PASS}@${HOST}:5432/${DB}"
-# Either inject DB_URL via an additional Secrets Manager secret you wire
-# into the task definition, or pass it through Parameter Store. The
-# module deliberately leaves this connection step to the operator since
-# it depends on how you want to rotate the DB password.
-
-# 6. Register the webhook URL with your GitHub App.
+# 5. Register the webhook URL with your GitHub App.
 terraform output -raw webhook_url
+# The DATABASE_URL is fully managed by Terraform: it's constructed from
+# the cluster endpoint + the auto-generated password and stored at
+# `database_url_secret_arn`. The ECS task definition reads it directly.
+# Rotate by `terraform taint random_password.db && terraform apply`,
+# then redeploy the task.
 ```
 
 ## What's NOT in this module

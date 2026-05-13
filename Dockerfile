@@ -50,9 +50,15 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 # distroless has no shell — execve resolution still uses it.
 COPY --from=build /src/target/release/orchestrator-app /usr/local/bin/orchestrator-app
 
-# Default config path. ECS deployments bind-mount the actual config (or
-# render it from Secrets Manager values) at `/etc/orchestrator.toml`. The
-# runbook covers per-field overrides via `ORCH_*` env vars; the config
-# file itself does not need to contain secrets in production.
+# Baseline config file. Every secret + deployment-identity field is a
+# placeholder; ECS task-definition env vars (defined in
+# infra/terraform/compute.tf) override them at task-start time. Baking
+# the structural fields in keeps the figment env-overlay path on a
+# known shape — without the file, the binary errors out before any
+# override can apply.
+COPY infra/orchestrator.docker.toml /etc/orchestrator.toml
+
+# Default invocation. ECS task definition's `command` would override
+# this for non-default invocations (e.g., a one-off ingest run).
 ENTRYPOINT ["/usr/local/bin/orchestrator-app"]
 CMD ["--config", "/etc/orchestrator.toml"]

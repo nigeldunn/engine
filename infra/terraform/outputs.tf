@@ -24,8 +24,13 @@ output "aurora_database" {
 }
 
 output "db_password_secret_arn" {
-  description = "Secrets Manager ARN holding the Aurora master password (terraform-generated). Use this to construct the full DATABASE_URL out-of-band."
+  description = "Secrets Manager ARN holding the Aurora master password (terraform-generated)."
   value       = aws_secretsmanager_secret.db_password.arn
+}
+
+output "database_url_secret_arn" {
+  description = "Secrets Manager ARN holding the fully-constructed Postgres URL (`postgres://orch:<password>@<endpoint>:5432/orch`). Terraform constructs this from the password + cluster endpoint; the ECS task injects it as ORCH_STORAGE__DATABASE_URL."
+  value       = aws_secretsmanager_secret.database_url.arn
 }
 
 output "github_app_pem_secret_arn" {

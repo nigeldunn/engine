@@ -56,3 +56,19 @@ variable "log_retention_days" {
   description = "CloudWatch Logs retention. 14 days is plenty for personal-use debugging without paying for long retention."
   default     = 14
 }
+
+variable "github_app_id" {
+  type        = number
+  description = "GitHub App ID from the App settings page. Visible in task-definition state (not a secret)."
+}
+
+variable "github_install_id" {
+  type        = number
+  description = "Installation ID for the org/user the GitHub App is installed on. Visible in task-definition state (not a secret)."
+}
+
+variable "agent_runner_base_url" {
+  type        = string
+  description = "Base URL the orchestrator hits for `/run/{type}` and `/status/{type}/{id}`. Personal-use deploys without an agent service can leave this as the default placeholder — actions will fail and the sink will be marked unhealthy, but the engine boots."
+  default     = "http://agent-svc.invalid:8080"
+}
