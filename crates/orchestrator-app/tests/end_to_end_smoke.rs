@@ -338,29 +338,65 @@ async fn happy_path_drives_through_to_merged() {
     );
     assert_eq!(state.pr_number, Some(STUB_PR_NUMBER));
 
-    // Sanity: the full event sequence we expect for a clean v1 cycle.
+    // Sanity check on the event sequence.
+    //
+    // Stage A wake-driven dispatch (commit 428322d) creates a real
+    // interleaving: `finalize_success` writes the outcome event first
+    // (which enqueues the reducer-derived follow-up action into the
+    // outbox), then its side events. If the wake fires before the
+    // side-event writes complete, the next action handler can begin a
+    // fresh `advance` against the same workflow; per-workflow sequence
+    // conflicts get retried, so the pending side event lands at a
+    // later sequence than the next main outcome.
+    //
+    // The strict-order assertion that used to live here flaked under
+    // exactly that pattern (task #6). We now check two weaker but
+    // still meaningful invariants:
+    //   1. The "spine" of main outcome events appears in causal order.
+    //      Each spine entry's reducer transitions the workflow into the
+    //      next step, so this order is a hard invariant of the design.
+    //   2. The total count of side `core.budget.consumed.v1` events
+    //      matches the number of agent steps that emit them.
+    //
+    // Per-event causation is verified upstream by individual reducer
+    // / dispatcher tests; this smoke test only needs to confirm the
+    // end-to-end flow reached every expected step.
     let events = executor.storage().read_events(&workflow_id).await.unwrap();
     let payload_types: Vec<_> = events.iter().map(|e| e.payload_type.as_str()).collect();
-    let expected: Vec<&str> = vec![
+
+    let spine: Vec<&str> = payload_types
+        .iter()
+        .copied()
+        .filter(|p| *p != "core.budget.consumed.v1")
+        .collect();
+    let expected_spine: Vec<&str> = vec![
         "workflow.ticket_ingested.v1",
         "agent.triage.completed.v1",
-        "core.budget.consumed.v1",
         "agent.plan.proposed.v1",
-        "core.budget.consumed.v1",
         "github.branch_ensured.v1",
         "agent.coder.output.v1",
-        "core.budget.consumed.v1",
         "github.commit_pushed.v1",
         "agent.reviewer.output.v1",
-        "core.budget.consumed.v1",
         "agent.security_reviewer.output.v1",
-        "core.budget.consumed.v1",
         "github.pr_opened.v1",
         "github.pr_merged.v1",
     ];
     assert_eq!(
-        payload_types, expected,
-        "event sequence diverged from the v1 happy path",
+        spine, expected_spine,
+        "main outcome spine diverged from the v1 happy path; full event log: {payload_types:?}",
+    );
+
+    // Five agent steps emit `core.budget.consumed.v1` as a side event:
+    // triage, plan, coder, reviewer, security_reviewer. Branch /
+    // commit / pr_opened / pr_merged are pure github operations and
+    // emit no budget.
+    let budget_count = payload_types
+        .iter()
+        .filter(|p| **p == "core.budget.consumed.v1")
+        .count();
+    assert_eq!(
+        budget_count, 5,
+        "expected one budget event per agent step (5); full event log: {payload_types:?}",
     );
 
     // Tear down the dispatcher cleanly.
