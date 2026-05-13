@@ -33,8 +33,10 @@ use orchestrator_github::RepoRef;
 #[command(name = "orchestrator-app", about = "Durable workflow engine for autonomous coding")]
 struct Cli {
     /// Path to the TOML config file (no implicit search path).
+    /// Required for `run` and `ingest`; ignored by `health` so the
+    /// container liveness probe doesn't need config / secrets loaded.
     #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -50,6 +52,23 @@ enum Command {
     /// if it's already running and shares the DB), the dispatcher
     /// will pick up the resulting actions.
     Ingest(IngestArgs),
+    /// Container liveness probe. HTTP-GETs `/healthz` on the local
+    /// webhook port and exits 0 on 200, non-zero otherwise. Designed
+    /// to be invoked by ECS `healthCheck` from inside a distroless
+    /// image (no shell, no wget) — the binary is its own probe.
+    /// Loads no config and contacts no external services, so a
+    /// missing PEM or unreachable Aurora cannot cause a false-negative
+    /// liveness signal.
+    Health(HealthArgs),
+}
+
+#[derive(Debug, Args)]
+struct HealthArgs {
+    /// Port the webhook listener is bound to. Defaults to 8080 to match
+    /// the orchestrator config example. Override with `--port` when the
+    /// task definition / config use a non-default port.
+    #[arg(long, default_value_t = 8080)]
+    port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -85,12 +104,30 @@ struct IngestArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Run);
+
+    // The health probe runs INSIDE the container as the ECS liveness
+    // check (compute.tf). It must not load config or initialize tracing
+    // — config-load failures would mask a healthy main process, and
+    // tracing setup would log to stderr on every probe (noisy in
+    // CloudWatch). Handle it before any of that runs.
+    if let Command::Health(args) = &command {
+        return health_probe_exit(args.port);
+    }
+
     let _guard = logging::init();
 
-    let cfg = match Config::load(&cli.config) {
+    let config_path = match cli.config.as_ref() {
+        Some(p) => p,
+        None => {
+            tracing::error!("missing required --config <PATH> for this subcommand");
+            return ExitCode::from(1);
+        }
+    };
+    let cfg = match Config::load(config_path) {
         Ok(c) => c,
         Err(err) => {
-            tracing::error!(%err, config_path = %cli.config.display(), "config load failed");
+            tracing::error!(%err, config_path = %config_path.display(), "config load failed");
             return ExitCode::from(1);
         }
     };
@@ -106,9 +143,56 @@ fn main() -> ExitCode {
         }
     };
 
-    match cli.command.unwrap_or(Command::Run) {
+    match command {
         Command::Run => rt.block_on(run_engine(cfg)),
         Command::Ingest(args) => rt.block_on(run_ingest_subcommand(cfg, args)),
+        Command::Health(_) => unreachable!("handled before tokio init above"),
+    }
+}
+
+/// Process-level liveness probe. Opens a TCP connection to
+/// `127.0.0.1:<port>`, sends a minimal HTTP/1.1 GET for `/healthz`,
+/// and inspects the status line.
+///
+/// Implementation note: deliberately uses raw `std::net::TcpStream`
+/// rather than reqwest so the probe (a) keeps the binary's dependency
+/// surface unchanged for this single shell-out, (b) starts in
+/// microseconds with no async runtime, and (c) cannot fail-open via a
+/// crate-level bug introduced elsewhere.
+fn health_probe_exit(port: u16) -> ExitCode {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let connect_result = TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(2),
+    );
+    let mut stream = match connect_result {
+        Ok(s) => s,
+        Err(_) => return ExitCode::from(1),
+    };
+    if stream.set_read_timeout(Some(Duration::from_secs(2))).is_err()
+        || stream.set_write_timeout(Some(Duration::from_secs(2))).is_err()
+    {
+        return ExitCode::from(1);
+    }
+    let request = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request).is_err() {
+        return ExitCode::from(1);
+    }
+    // Read just the status line — we don't care about headers or body
+    // for a liveness check. 128 bytes is plenty.
+    let mut buf = [0u8; 128];
+    let n = match stream.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return ExitCode::from(1),
+    };
+    let head = &buf[..n];
+    if head.starts_with(b"HTTP/1.1 200") || head.starts_with(b"HTTP/1.0 200") {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
