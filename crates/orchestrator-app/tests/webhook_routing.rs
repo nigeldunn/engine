@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use hmac::{Hmac, Mac};
-use orchestrator_app::server::build_webhook_router;
+use orchestrator_app::server::{build_health_router, build_webhook_router};
 use orchestrator_coding_workflow::WorkflowReducer;
 use orchestrator_core::test_support::{fresh_storage, DbGuard};
 use orchestrator_core::{Executor, WorkflowId};
@@ -260,4 +260,36 @@ async fn webhook_for_pull_request_closed_without_merge_is_ignored() {
         .await
         .unwrap();
     assert_eq!(events.len(), 1);
+}
+
+/// Stage-C contract: `GET /healthz` returns 200 OK without touching any
+/// dispatcher or storage state. Built from `build_health_router()` alone
+/// — no `Executor` or `Storage` is ever in scope, so this test
+/// structurally proves the route cannot hit Postgres. ECS / ALB /
+/// container health probes rely on this to keep Aurora paused at idle.
+#[tokio::test]
+async fn healthz_returns_200_without_touching_storage() {
+    let router = build_health_router();
+    let req = Request::builder()
+        .uri("/healthz")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Verifies that an unsigned POST to `/healthz` is rejected with 405
+/// rather than reaching a handler that might leak state. Cheap guard so
+/// a future maintainer doesn't accidentally widen the route to `any()`.
+#[tokio::test]
+async fn healthz_rejects_non_get() {
+    let router = build_health_router();
+    let req = Request::builder()
+        .uri("/healthz")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }

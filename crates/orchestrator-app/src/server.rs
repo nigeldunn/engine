@@ -8,7 +8,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use orchestrator_coding_workflow::WorkflowReducer;
@@ -45,6 +45,23 @@ pub async fn bind_webhook_listener(listen: SocketAddr) -> Result<TcpListener, Se
         .map_err(|source| ServerError::Bind { addr: listen, source })
 }
 
+/// Process-only health check. Returns `200 OK` without touching Storage,
+/// the dispatcher, or any sink. This is what ECS / ALB / API Gateway
+/// container health probes must hit — anything that queries Postgres
+/// would defeat the Aurora auto-pause work in Stages A and B
+/// (see `docs/AWS_ECS_AURORA_DEPLOYMENT.md`).
+async fn healthz() -> StatusCode {
+    StatusCode::OK
+}
+
+/// Build a tiny router that exposes only `GET /healthz`. The path lives
+/// at the root regardless of the webhook's configured `path_prefix`, so
+/// load balancers and container health checks don't need to know how the
+/// operator configured webhook routing.
+pub fn build_health_router() -> Router {
+    Router::new().route("/healthz", get(healthz))
+}
+
 /// Run the webhook server on an already-bound listener until `shutdown`
 /// fires. Errors during a single delivery do NOT take the server down —
 /// they're mapped to HTTP responses or logged. `wake` is the dispatcher's
@@ -76,11 +93,18 @@ pub async fn run_webhook(
         lookup_retry_backoff,
         wake,
     );
-    let router = if path_prefix.is_empty() || path_prefix == "/" {
-        inner
-    } else {
-        axum::Router::new().nest(&path_prefix, inner)
-    };
+    // `/healthz` is merged at the root regardless of the webhook
+    // `path_prefix` so health probes have a stable path. The two
+    // routers can't conflict — webhook traffic lives under
+    // `path_prefix` (or `/` when empty, but the github router only
+    // handles its own POST endpoints, not GET /healthz).
+    let router = build_health_router().merge(
+        if path_prefix.is_empty() || path_prefix == "/" {
+            inner
+        } else {
+            axum::Router::new().nest(&path_prefix, inner)
+        },
+    );
 
     info!("webhook server listening");
     axum::serve(listener, router)
