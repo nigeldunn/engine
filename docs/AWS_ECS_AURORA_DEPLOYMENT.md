@@ -1,32 +1,43 @@
 # AWS ECS Express and Aurora Serverless deployment plan
 
-> **Status (2026-05-13):** partial progress on the work in
-> §"Application changes":
+> **Status (2026-05-13):** the application-side work needed to make
+> Aurora auto-pause viable is now complete. Remaining items are
+> deployment artifacts.
 >
 > - **Storage backend + `[storage]` config:** complete. The codebase
->   is Postgres-only; `docker-compose.yml` provides local dev; the
->   env override is `ORCH_STORAGE__DATABASE_URL`.
+>   is Postgres-only; `docker-compose.yml` provides local dev; the env
+>   override is `ORCH_STORAGE__DATABASE_URL`.
 > - **DB pool tuning for Aurora auto-pause:** complete. The pool in
 >   `crates/orchestrator-core/src/storage.rs` uses `min_connections=0`,
->   a 60s idle timeout, and a 30s acquire timeout to tolerate
->   cold-resume latency.
-> - **Aurora idle behavior (event-driven dispatcher wakeups):** not
->   done. `Dispatcher` still owns a single `Notify` used only for
->   shutdown (`crates/orchestrator-core/src/dispatcher.rs`), so the
->   default poll loop and the unconditional health-check loop keep
->   Aurora warm regardless of incoming load.
-> - **Unified HTTP listener + `/healthz`:** not done.
->   `crates/orchestrator-app/src/runtime.rs` still binds separate
->   webhook and ingest listeners; no `/healthz` route exists in
->   `crates/orchestrator-app/src/server.rs`. ECS health checks would
->   need one.
+>   a 60s idle timeout, and a 30s acquire timeout for cold-resume.
+> - **Event-driven dispatcher wakeups (Stage A — commit `428322d`):**
+>   complete. `Dispatcher::wake_handle` is fired by the webhook and
+>   ingest HTTP handlers on success and by each completed action task,
+>   so the main claim loop skips `poll_interval` whenever fresh work
+>   lands.
+> - **Idle health-loop gating (Stage B — commit `0515353`):** complete.
+>   An in-memory unhealthy-sink cache is loaded once from persisted
+>   state at `run()` startup; the background health loop skips its
+>   iteration entirely when the cache is empty. `compute_healthy_kinds`
+>   also reads the cache, eliminating the per-claim `unhealthy_sink_keys`
+>   query.
+> - **Process-only `/healthz` (Stage C — commit `980fc70`):** complete.
+>   `GET /healthz` is mounted at the root of the webhook listener (so
+>   it's stable regardless of `path_prefix`). The handler takes no
+>   parameters and the route builder takes no `Executor`, so by
+>   construction it cannot reach Postgres.
+> - **Unified HTTP listener:** still not done. `runtime.rs` binds
+>   separate webhook (public) and ingest (loopback by default)
+>   listeners. ECS Express can target the webhook listener alone if
+>   ingest stays loopback; a single listener is only required if both
+>   endpoints must be public on one port.
 > - **Container and ECS artifacts:** not done. No Dockerfile or task
 >   definition in tree.
 >
-> The "Aurora mostly paused" scenarios in the cost table assume the
-> Aurora-idle and HTTP changes land. Without them, budget as though
-> Aurora stays at minimum active capacity. Sections describing the
-> SQLite baseline are kept for historical reference.
+> With Stages A + B + C in place, the "Aurora mostly paused" scenarios
+> in the cost table become achievable for personal-use workloads.
+> Sections describing the SQLite baseline are kept for historical
+> reference.
 
 Prepared: 2026-05-09
 Target work date: 2026-05-10
@@ -209,21 +220,26 @@ remains for the personal-use deployment shape.
 4. `(done)` Port app-level SQL in ingest and webhook lookup.
 5. `(done)` Add Postgres integration tests using a disposable local
    Postgres.
-6. `(todo)` Add unified HTTP listener and `/healthz`. `/healthz`
-   must return 200 without touching Storage so ECS health checks do
-   not wake Aurora.
-7. `(partial)` Idle-friendly dispatcher behavior:
+6. `(partial)` HTTP listener shape:
+   - `(done)` `GET /healthz` returns 200 without touching Storage
+     (commit `980fc70`). Mounted at the root of the webhook listener.
+   - `(todo)` Single unified listener serving `/webhook/*`, `/tickets`,
+     and `/healthz` on one port. Currently webhook (public) and ingest
+     (loopback by default) are bound separately. Only required if both
+     endpoints must be public on one port; ECS can target webhook alone
+     when ingest stays loopback.
+7. `(done)` Idle-friendly dispatcher behavior:
    - `(done)` DB pool tuning at
      `crates/orchestrator-core/src/storage.rs` (`max=5`, `min=0`,
      `idle=60s`, `acquire=30s`).
-   - `(todo)` Wake-driven dispatcher loop: expose a wake `Notify`
-     alongside `shutdown_handle()` and fire it from the webhook
-     handler, the ingest handler, and after each successful
-     `executor.advance` inside the dispatcher. The existing
-     `poll_interval` becomes a fallback only.
-   - `(todo)` Stop the health-check loop from running
-     `list_unhealthy_sinks` every `health_check_interval` at idle —
-     gate it on a non-empty in-memory unhealthy-sink set.
+   - `(done)` Wake-driven dispatcher loop (commit `428322d`).
+     `Dispatcher::wake_handle()` is fired by the webhook handler, the
+     ingest handler, and after each completed action task. `select!`
+     uses `biased;` so shutdown wins ties against a stored wake permit.
+   - `(done)` Idle health-loop gating (commit `0515353`).
+     `unhealthy_keys` cache loaded once at `run()` startup (fatal on
+     storage failure — rule 8); health loop skips iteration when the
+     cache is empty; `compute_healthy_kinds` also reads the cache.
 8. `(todo)` Add Dockerfile (ARM64, glibc, distroless) and ECS task /
    service config.
 9. `(todo)` Deploy to a dev ECS service with Aurora min 0 ACUs.

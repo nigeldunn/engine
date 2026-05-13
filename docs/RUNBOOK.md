@@ -249,6 +249,16 @@ needed. Safe concurrent with a running engine: `Storage::advance` is
 transactional and Postgres serialises any contention through per-row
 locks.
 
+**Latency caveat — the CLI does NOT wake a running dispatcher.** The
+dispatcher uses an in-process `Notify` to skip its `poll_interval` when
+new work lands; that signal only crosses process boundaries via the
+HTTP `/tickets` endpoint. If you ingest via the CLI while a separate
+engine process is running, the action will be claimed on the next
+fallback poll tick (the configured `dispatcher.poll_interval_ms`). For
+immediate pickup, POST to `/tickets` instead. The latency difference
+matters most when `poll_interval_ms` is tuned long for Aurora
+auto-pause; with a short poll it is negligible.
+
 Exit codes:
 
 | Code | Meaning |
@@ -325,6 +335,15 @@ GitHub posts to `https://your-host/{path_prefix}/`. The webhook handler:
    `github.pr_opened.v1` event matching `(repo.owner, repo.name, pr_number)`.
    Owner/name comparison is case-insensitive — GitHub canonicalizes.
 4. Translates to a `PrMerged` event and calls `executor.advance(...)`.
+
+### `GET /healthz`
+
+The webhook listener also serves `GET /healthz` at the root (independent
+of `path_prefix`). It returns `200 OK` with no body and does NOT touch
+Postgres, the dispatcher, or any sink — by construction, the handler
+takes no state. This is what ECS / ALB / API Gateway container health
+probes should hit. Any health endpoint that queried Storage would defeat
+Aurora auto-pause.
 
 ### The open-then-merge race
 
