@@ -1,0 +1,32 @@
+# Keep the Docker build context lean. The build needs only Cargo.toml,
+# Cargo.lock, and the `crates/` workspace; everything else is either
+# build output, IDE/state, docs, or local-only config.
+target/
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+
+# Local state — never copy these into an image.
+.claude/
+.codex
+orchestrator.toml
+docker-compose.yml
+*.log
+.DS_Store
+
+# Defensive exclude for accidentally committed secrets (Codex Stage-E
+# review: catch local `.env` files / private keys in case they ever end
+# up in the repo root, even though `.gitignore` should keep them out).
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Docs and top-level markdown. The binary doesn't read them at runtime.
+docs/
+*.md
+
+# Test data / temp.
+tmp/
