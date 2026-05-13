@@ -10,10 +10,10 @@
 //!   - Background health-check loop probes unhealthy sinks via `check_health`
 //!     with a queue-derived scope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, instrument, warn};
@@ -78,6 +78,18 @@ pub struct Dispatcher<R: Reducer> {
     /// Single-consumer (only the main `run` loop waits on it), so
     /// `notify_one()` is sufficient — no waiter-broadcast dance is needed.
     wake: Arc<Notify>,
+    /// In-memory cache of sink_keys currently marked unhealthy. The
+    /// persisted `sink_health` table is still the source of truth (rule 8
+    /// in CLAUDE.md), but the cache is loaded once at `run()` startup and
+    /// kept in sync with every `mark_sink_*` storage write that happens
+    /// inside this process.
+    ///
+    /// Why a cache: without it, the main loop's `compute_healthy_kinds`
+    /// and the background health-check loop both hit Postgres on every
+    /// cycle regardless of state. With it, an idle dispatcher (no
+    /// unhealthy sinks, no pending work) makes zero queries — the
+    /// precondition for Aurora Serverless auto-pause.
+    unhealthy_keys: Arc<RwLock<HashSet<String>>>,
 }
 
 impl<R: Reducer> Dispatcher<R> {
@@ -91,6 +103,7 @@ impl<R: Reducer> Dispatcher<R> {
             config,
             shutdown: Arc::new(Notify::new()),
             wake: Arc::new(Notify::new()),
+            unhealthy_keys: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -132,6 +145,17 @@ impl<R: Reducer> Dispatcher<R> {
         self.wake.clone()
     }
 
+    /// Handle to the in-memory unhealthy-sink cache. Operator tools that
+    /// mutate `sink_health` storage out-of-band (e.g.,
+    /// [`force_health_recheck`]) must pass this handle alongside so the
+    /// running dispatcher's view of which sinks are healthy stays in
+    /// sync. Without it, an operator-forced `Unhealthy` would let the
+    /// main loop claim and execute one more action before the
+    /// `SinkUnhealthy` outcome repopulates the cache.
+    pub fn unhealthy_cache_handle(&self) -> Arc<RwLock<HashSet<String>>> {
+        self.unhealthy_keys.clone()
+    }
+
     /// Run the dispatcher loop until shutdown.
     #[instrument(skip(self), fields(dispatcher = %self.id))]
     pub async fn run(self) -> Result<(), DispatcherError> {
@@ -140,15 +164,53 @@ impl<R: Reducer> Dispatcher<R> {
             Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrent_attempts));
         let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-        // Spawn health-check loop.
+        // Prime the in-memory unhealthy-sink cache from persisted state.
+        // Failing to load is FATAL: an empty cache plus a populated
+        // sink_health table would mean `compute_healthy_kinds` claims
+        // actions for sinks that are persisted as unhealthy, burning
+        // attempts and triggering side effects we already know will
+        // fail. Rule 8 in CLAUDE.md says persisted state is the source
+        // of truth — refusing to start until we can read it preserves
+        // that invariant. The process supervisor (ECS / systemd / k8s)
+        // restarts; sqlx's pool acquire_timeout (30s by default) already
+        // absorbs Aurora cold-resume.
+        match self.executor.storage().list_unhealthy_sinks().await {
+            Ok(records) => {
+                let mut set = self.unhealthy_keys.write().await;
+                for r in records {
+                    set.insert(r.sink_key);
+                }
+                info!(
+                    count = set.len(),
+                    "loaded unhealthy sinks into in-memory cache"
+                );
+            }
+            Err(e) => {
+                error!(error = %e, "failed to load unhealthy sinks at startup");
+                return Err(e.into());
+            }
+        }
+
+        // Spawn health-check loop. It owns clones of the executor + cache
+        // and gates each iteration on the cache being non-empty so an
+        // idle process makes zero Postgres queries per `health_check_interval`.
         let health_handle = {
             let executor = self.executor.clone();
             let sinks_by_key = self.sinks_by_key.clone();
             let extractors = self.extractors.clone();
             let interval = self.config.health_check_interval;
             let shutdown = self.shutdown.clone();
+            let unhealthy_keys = self.unhealthy_keys.clone();
             tokio::spawn(async move {
-                health_check_loop(executor, sinks_by_key, extractors, interval, shutdown).await;
+                health_check_loop(
+                    executor,
+                    sinks_by_key,
+                    extractors,
+                    interval,
+                    shutdown,
+                    unhealthy_keys,
+                )
+                .await;
             })
         };
 
@@ -190,14 +252,8 @@ impl<R: Reducer> Dispatcher<R> {
             }
 
             // Compute the set of healthy action kinds for this cycle.
-            let healthy_kinds = match self.compute_healthy_kinds().await {
-                Ok(k) => k,
-                Err(e) => {
-                    error!(error = %e, "failed to compute healthy kinds, backing off");
-                    sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
+            // Cache-only read (no Postgres hit) — see `compute_healthy_kinds`.
+            let healthy_kinds = self.compute_healthy_kinds().await;
 
             if healthy_kinds.is_empty() {
                 // All sinks unhealthy or none registered. Back off.
@@ -243,6 +299,7 @@ impl<R: Reducer> Dispatcher<R> {
                 let lease = self.config.lease_duration;
                 let unhealthy_delay = self.config.sink_unhealthy_retry_delay;
                 let wake = self.wake.clone();
+                let unhealthy_keys = self.unhealthy_keys.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
@@ -253,6 +310,7 @@ impl<R: Reducer> Dispatcher<R> {
                         lease,
                         unhealthy_delay,
                         action,
+                        unhealthy_keys,
                     )
                     .await
                     {
@@ -271,21 +329,25 @@ impl<R: Reducer> Dispatcher<R> {
         }
     }
 
-    /// Computes the action kinds for which the responsible sink is currently
-    /// healthy in persisted storage.
-    async fn compute_healthy_kinds(&self) -> Result<Vec<String>, DispatcherError> {
-        let unhealthy_keys = self.executor.storage().unhealthy_sink_keys().await?;
+    /// Computes the action kinds for which the responsible sink is
+    /// currently healthy. Reads the in-memory `unhealthy_keys` cache
+    /// (which is loaded from storage at `run()` startup and kept in sync
+    /// with subsequent `mark_sink_*` writes), so this is a lock-only
+    /// operation — no Postgres round-trip per claim cycle.
+    async fn compute_healthy_kinds(&self) -> Vec<String> {
+        let unhealthy = self.unhealthy_keys.read().await;
         let mut kinds = Vec::new();
         for (kind, sink) in &self.sinks_by_kind {
-            if !unhealthy_keys.iter().any(|k| k == sink.sink_key()) {
+            if !unhealthy.contains(sink.sink_key()) {
                 kinds.push(kind.to_string());
             }
         }
-        Ok(kinds)
+        kinds
     }
 }
 
-#[instrument(skip(executor, sinks, action), fields(
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(executor, sinks, action, unhealthy_keys), fields(
     action_id = %action.action_id,
     workflow_id = %action.workflow_id,
     kind = %action.kind,
@@ -299,6 +361,7 @@ async fn handle_action<R: Reducer>(
     lease_duration: Duration,
     sink_unhealthy_retry_delay: Duration,
     action: ClaimedAction,
+    unhealthy_keys: Arc<RwLock<HashSet<String>>>,
 ) -> Result<(), DispatcherError> {
     let storage = executor.storage().clone();
 
@@ -450,6 +513,16 @@ async fn handle_action<R: Reducer>(
             storage
                 .mark_sink_unhealthy(sink.sink_key(), reason, &detail)
                 .await?;
+            // Mirror the storage write into the in-memory cache so the
+            // main loop's next `compute_healthy_kinds` filters out this
+            // sink's kinds without a fresh Postgres lookup. Order matters:
+            // cache update happens AFTER the storage write succeeds — on
+            // storage Err we return early via `?` and the cache stays
+            // consistent with persisted state.
+            unhealthy_keys
+                .write()
+                .await
+                .insert(sink.sink_key().to_string());
             // Roll the action back: clear lease, reset to pending, no attempt increment.
             // Note: record_attempt_start added an audit row for `next_attempt`. That's
             // fine - it's a started-but-not-finished audit record indicating an aborted
@@ -577,6 +650,7 @@ async fn health_check_loop<R: Reducer>(
     extractors: Vec<Arc<dyn HintExtractor>>,
     interval: Duration,
     shutdown: Arc<Notify>,
+    unhealthy_keys: Arc<RwLock<HashSet<String>>>,
 ) {
     loop {
         tokio::select! {
@@ -592,20 +666,28 @@ async fn health_check_loop<R: Reducer>(
             _ = sleep(interval) => {}
         }
 
-        let unhealthy = match executor.storage().list_unhealthy_sinks().await {
-            Ok(list) => list,
-            Err(e) => {
-                warn!(error = %e, "list_unhealthy_sinks failed");
+        // Snapshot the cache. When the set is empty (the common case at
+        // idle), skip the entire iteration — no `list_unhealthy_sinks`
+        // query, no Postgres round-trip. This is the lever that lets
+        // Aurora auto-pause when nothing is actually unhealthy.
+        let probe_keys: Vec<String> = {
+            let set = unhealthy_keys.read().await;
+            if set.is_empty() {
                 continue;
             }
+            set.iter().cloned().collect()
         };
 
-        for record in unhealthy {
-            let Some(sink) = sinks_by_key.get(&record.sink_key) else {
+        for sink_key in probe_keys {
+            let Some(sink) = sinks_by_key.get(&sink_key) else {
+                // Stale cache entry for a sink no longer registered; drop it.
+                unhealthy_keys.write().await.remove(&sink_key);
                 continue;
             };
 
-            // Build a scope from active kinds for this sink.
+            // Build a scope from active kinds for this sink. Scope-build
+            // itself hits storage (it derives queue-tied hints), so it
+            // only runs when there's actually an unhealthy sink to probe.
             let active_kinds: Vec<&str> = sink.handles().to_vec();
             let scope = match executor
                 .storage()
@@ -614,16 +696,21 @@ async fn health_check_loop<R: Reducer>(
             {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!(error = %e, sink = %record.sink_key, "scope build failed");
+                    warn!(error = %e, sink = %sink_key, "scope build failed");
                     continue;
                 }
             };
 
             match sink.check_health(scope).await {
                 SinkHealthState::Healthy => {
-                    info!(sink = %record.sink_key, "sink recovered");
-                    if let Err(e) = executor.storage().mark_sink_healthy(&record.sink_key).await {
+                    info!(sink = %sink_key, "sink recovered");
+                    if let Err(e) = executor.storage().mark_sink_healthy(&sink_key).await {
                         warn!(error = %e, "mark_sink_healthy failed");
+                        // Leave the cache entry in place so we retry the
+                        // recovery write on the next health interval —
+                        // matches persisted state, which is still unhealthy.
+                    } else {
+                        unhealthy_keys.write().await.remove(&sink_key);
                     }
                 }
                 SinkHealthState::Unhealthy {
@@ -631,17 +718,18 @@ async fn health_check_loop<R: Reducer>(
                     detail,
                     ..
                 } => {
-                    debug!(sink = %record.sink_key, ?reason, %detail, "still unhealthy");
+                    debug!(sink = %sink_key, ?reason, %detail, "still unhealthy");
                     if let Err(e) = executor
                         .storage()
-                        .mark_sink_unhealthy(&record.sink_key, reason, &detail)
+                        .mark_sink_unhealthy(&sink_key, reason, &detail)
                         .await
                     {
                         warn!(error = %e, "mark_sink_unhealthy failed");
                     }
+                    // Cache already has this entry; re-insert is a no-op.
                 }
                 SinkHealthState::Indeterminate { detail } => {
-                    debug!(sink = %record.sink_key, %detail, "health indeterminate, no change");
+                    debug!(sink = %sink_key, %detail, "health indeterminate, no change");
                 }
             }
         }
@@ -649,10 +737,16 @@ async fn health_check_loop<R: Reducer>(
 }
 
 /// Force a health re-check for a specific sink. Used by operator tools.
+/// `unhealthy_keys` is the running dispatcher's cache handle (obtained
+/// via [`Dispatcher::unhealthy_cache_handle`]) — it MUST be passed so an
+/// operator-forced state change is visible to the main claim loop
+/// immediately rather than after one failed action attempt repopulates
+/// the cache via the `SinkUnhealthy` outcome path.
 pub async fn force_health_recheck<R: Reducer>(
     executor: &Executor<R>,
     sinks_by_key: &HashMap<String, Arc<dyn Sink>>,
     extractors: &[Arc<dyn HintExtractor>],
+    unhealthy_keys: &Arc<RwLock<HashSet<String>>>,
     sink_key: &str,
 ) -> Result<SinkHealthState, DispatcherError> {
     let Some(sink) = sinks_by_key.get(sink_key) else {
@@ -668,15 +762,20 @@ pub async fn force_health_recheck<R: Reducer>(
         .await?;
     let state = sink.check_health(scope).await;
 
+    // Storage write first, then cache mutation — `?` aborts before the
+    // cache touch on storage Err, keeping cache consistent with persisted
+    // state on the failure path.
     match &state {
         SinkHealthState::Healthy => {
             executor.storage().mark_sink_healthy(sink_key).await?;
+            unhealthy_keys.write().await.remove(sink_key);
         }
         SinkHealthState::Unhealthy { reason, detail, .. } => {
             executor
                 .storage()
                 .mark_sink_unhealthy(sink_key, *reason, detail)
                 .await?;
+            unhealthy_keys.write().await.insert(sink_key.to_string());
         }
         SinkHealthState::Indeterminate { .. } => {}
     }

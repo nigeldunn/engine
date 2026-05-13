@@ -74,6 +74,10 @@ struct CountingSink {
     unhealthy: Arc<AtomicBool>,
     /// 0=Healthy, 1=Unhealthy, 2=Indeterminate
     health_return: Arc<AtomicUsize>,
+    /// Stage B: counts every call to `check_health`. Stays at 0 while
+    /// the dispatcher's in-memory unhealthy cache is empty — proves the
+    /// health loop is gated and not making Postgres queries at idle.
+    health_invocations: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -83,6 +87,7 @@ struct CountingSinkHandles {
     fail_first_n: Arc<AtomicUsize>,
     unhealthy: Arc<AtomicBool>,
     health_return: Arc<AtomicUsize>,
+    health_invocations: Arc<AtomicUsize>,
 }
 
 impl CountingSink {
@@ -91,11 +96,13 @@ impl CountingSink {
         let fail_first_n = Arc::new(AtomicUsize::new(0));
         let unhealthy = Arc::new(AtomicBool::new(false));
         let health_return = Arc::new(AtomicUsize::new(0));
+        let health_invocations = Arc::new(AtomicUsize::new(0));
         let handles = CountingSinkHandles {
             invocations: invocations.clone(),
             fail_first_n: fail_first_n.clone(),
             unhealthy: unhealthy.clone(),
             health_return: health_return.clone(),
+            health_invocations: health_invocations.clone(),
         };
         let sink = Self {
             sink_key: key.to_string(),
@@ -103,6 +110,7 @@ impl CountingSink {
             fail_first_n,
             unhealthy,
             health_return,
+            health_invocations,
         };
         (sink, handles)
     }
@@ -114,6 +122,7 @@ impl Sink for CountingSink {
     fn sink_key(&self) -> &str { &self.sink_key }
 
     async fn check_health(&self, _scope: SinkHealthScope) -> SinkHealthState {
+        self.health_invocations.fetch_add(1, Ordering::SeqCst);
         match self.health_return.load(Ordering::SeqCst) {
             0 => SinkHealthState::Healthy,
             1 => SinkHealthState::Unhealthy {
@@ -476,6 +485,127 @@ async fn indeterminate_health_check_preserves_state() {
     let record = storage.get_sink_health("test-sink").await.unwrap().unwrap();
     assert_eq!(record.state, PersistedHealthState::Unhealthy);
     assert_eq!(record.detail.as_deref(), Some("before"));
+}
+
+/// Stage-B guard for rule 8 ("sink health is persisted"): when the
+/// `sink_health` table already contains an unhealthy row at startup
+/// (e.g., a prior process crashed mid-outage), the new dispatcher must
+/// load that row into its in-memory cache so `compute_healthy_kinds`
+/// excludes the affected sink from the FIRST claim cycle. Without this,
+/// fail-open behavior would burn an action attempt rediscovering the
+/// already-known-bad sink — exactly the regression Codex Stage-B
+/// review flagged as BLOCKING.
+#[tokio::test]
+async fn dispatcher_loads_persisted_unhealthy_state_at_startup() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (storage, _db) = fresh_storage().await;
+
+    // Pre-populate the persisted state BEFORE starting the dispatcher.
+    storage
+        .mark_sink_unhealthy(
+            "test-sink",
+            SinkUnhealthyReason::ExternalSystemDown,
+            "set before startup",
+        )
+        .await
+        .unwrap();
+
+    let executor = Arc::new(Executor::new(storage, CounterReducer));
+    let mut dispatcher = Dispatcher::new(
+        executor.clone(),
+        DispatcherConfig {
+            // Short poll so any cache miss would surface quickly.
+            poll_interval: Duration::from_millis(30),
+            // Long health interval so the health-loop recovery path
+            // cannot rescue the test by re-probing within the window.
+            health_check_interval: Duration::from_secs(60),
+            lease_duration: Duration::from_secs(30),
+            sink_unhealthy_retry_delay: Duration::from_millis(100),
+            ..Default::default()
+        },
+    );
+    let (sink, handles) = CountingSink::new_with_handles("test-sink");
+    dispatcher.register(sink);
+    let shutdown = dispatcher.shutdown_handle();
+    tokio::spawn(dispatcher.run());
+
+    // Enqueue an action whose kind is served by the unhealthy sink.
+    let workflow_id = WorkflowId::new("wf-startup-unhealthy");
+    executor
+        .advance(EventCommand {
+            workflow_id: workflow_id.clone(),
+            payload_type: "increment.v1".into(),
+            payload_schema_version: 1,
+            payload: json!({}),
+            causation: Causation::External {
+                source: "test".into(),
+                request_id: "req-startup-uh".into(),
+            },
+            trace_id: None,
+            ingress_dedup_key: Some("req-startup-uh".into()),
+        })
+        .await
+        .unwrap();
+
+    // Give the dispatcher enough wall time for at least several claim
+    // cycles. With the cache correctly seeded, the sink's `execute`
+    // should never be called — the action stays queued because
+    // `compute_healthy_kinds` excludes the kind. 300ms covers ~10 polls.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let invocations = handles.invocations.load(Ordering::SeqCst);
+    assert_eq!(
+        invocations, 0,
+        "dispatcher must respect persisted unhealthy state at startup; \
+         a fail-open load would have claimed + executed the action"
+    );
+
+    shutdown.notify_one();
+}
+
+/// Stage-B guard: when no sink is marked unhealthy, the background
+/// health loop must not probe sinks (and therefore must not run
+/// `list_unhealthy_sinks` against Postgres). The dispatcher loads the
+/// `sink_health` table once at startup into an in-memory cache; if the
+/// cache is empty the loop sleeps and skips the iteration entirely.
+/// This test pins that behavior so a future refactor that re-introduces
+/// per-tick storage queries fails here.
+#[tokio::test]
+async fn idle_health_loop_does_not_probe_sinks() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (storage, _db) = fresh_storage().await;
+    let executor = Arc::new(Executor::new(storage, CounterReducer));
+
+    // Aggressively short health interval so we observe many tick windows
+    // in a brief test wait — if the loop was probing, the counter would
+    // climb fast. Poll interval kept long so the main loop also stays
+    // quiet.
+    let mut dispatcher = Dispatcher::new(
+        executor.clone(),
+        DispatcherConfig {
+            poll_interval: Duration::from_secs(10),
+            lease_duration: Duration::from_secs(30),
+            health_check_interval: Duration::from_millis(20),
+            sink_unhealthy_retry_delay: Duration::from_millis(100),
+            ..Default::default()
+        },
+    );
+    let (sink, handles) = CountingSink::new_with_handles("test-sink");
+    dispatcher.register(sink);
+    let shutdown = dispatcher.shutdown_handle();
+    tokio::spawn(dispatcher.run());
+
+    // 500ms gives the health loop 20+ tick opportunities. With the
+    // empty-cache gate intact, every tick should skip the probe. Wait
+    // briefly so the dispatcher has time to spawn the health loop, then
+    // sample the counter.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let probes = handles.health_invocations.load(Ordering::SeqCst);
+    assert_eq!(
+        probes, 0,
+        "idle health loop must not call `check_health` when no sink is unhealthy; observed {probes} probes",
+    );
+
+    shutdown.notify_one();
 }
 
 /// Regression for the dispatcher shutdown bug: `Notify::notify_one()` only
