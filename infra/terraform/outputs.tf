@@ -8,11 +8,6 @@ output "healthz_url" {
   value       = "${aws_apigatewayv2_api.this.api_endpoint}/healthz"
 }
 
-output "ecr_repository_url" {
-  description = "Push the orchestrator-app container image here BEFORE the ECS service can pull. `docker buildx build --platform linux/arm64 -t <this>:latest .` then `docker push <this>:latest`."
-  value       = aws_ecr_repository.orch.repository_url
-}
-
 output "aurora_writer_endpoint" {
   description = "Aurora cluster writer endpoint (internal). Useful when constructing `ORCH_STORAGE__DATABASE_URL` for the operator-managed secret."
   value       = aws_rds_cluster.this.endpoint
@@ -56,4 +51,29 @@ output "ingest_bearer_token_secret_arn" {
 output "task_log_group" {
   description = "CloudWatch log group for ECS task stdout/stderr."
   value       = aws_cloudwatch_log_group.task.name
+}
+
+output "github_actions_deploy_role_arn" {
+  description = "IAM role ARN the GitHub Actions deploy workflow assumes via OIDC. Set this as the repo variable `AWS_DEPLOY_ROLE_ARN`."
+  value       = aws_iam_role.github_actions_deploy.arn
+}
+
+output "ecs_cluster_name" {
+  description = "ECS cluster name. Set this as the repo variable `ECS_CLUSTER` (matches the Terraform default `${"$"}{project}-cluster`)."
+  value       = aws_ecs_cluster.this.name
+}
+
+output "ecs_service_name" {
+  description = "ECS service name. Set this as the repo variable `ECS_SERVICE`."
+  value       = aws_ecs_service.orch.name
+}
+
+output "ecs_task_family" {
+  description = "ECS task definition family. Set this as the repo variable `ECS_TASK_FAMILY`."
+  value       = aws_ecs_task_definition.orch.family
+}
+
+output "ecs_container_name" {
+  description = "Container name within the task definition. The deploy workflow needs this to know which container's `image` field to swap. Set as `ECS_CONTAINER_NAME` repo variable."
+  value       = local.name
 }

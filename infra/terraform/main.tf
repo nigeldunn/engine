@@ -57,6 +57,14 @@ locals {
 
   public_subnet_cidrs  = ["10.0.0.0/24", "10.0.1.0/24"]
   private_subnet_cidrs = ["10.0.10.0/24", "10.0.11.0/24"]
+
+  # Bootstrap image for the initial task-definition revision. The
+  # deploy workflow registers subsequent revisions pinned to a commit
+  # SHA; the ECS service ignores task_definition changes from
+  # Terraform after that, so this default is only the first-apply
+  # value. Override with `-var container_image=...` if you need to
+  # bootstrap from a specific tag.
+  container_image = coalesce(var.container_image, "ghcr.io/${lower(var.github_repo)}:latest")
 }
 
 data "aws_availability_zones" "available" {

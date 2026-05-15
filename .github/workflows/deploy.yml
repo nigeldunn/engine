@@ -1,0 +1,121 @@
+name: Deploy
+
+# Build the orchestrator-app container image, push to GHCR, then
+# register a new ECS task-definition revision pinned to the image SHA
+# and roll the service.
+#
+# Required GitHub repo configuration (set under Settings → Secrets and
+# variables → Actions → Variables):
+#   AWS_REGION             — e.g. ap-southeast-2
+#   AWS_DEPLOY_ROLE_ARN    — output of `terraform output -raw github_actions_deploy_role_arn`
+#   ECS_CLUSTER            — output of `terraform output -raw ecs_cluster_name`
+#   ECS_SERVICE            — output of `terraform output -raw ecs_service_name`
+#   ECS_TASK_FAMILY        — output of `terraform output -raw ecs_task_family`
+#   ECS_CONTAINER_NAME     — output of `terraform output -raw ecs_container_name`
+#
+# The GHCR package must be public for ECS to pull it without
+# `repositoryCredentials`. After the very first push, flip visibility
+# at the settings page for this package:
+#   user-owned repo: https://github.com/users/<owner>/packages/container/<repo>/settings
+#   org-owned repo:  https://github.com/orgs/<owner>/packages/container/<repo>/settings
+#
+# Bootstrap caveat: if the GHCR package was first pushed by a
+# personal `docker push` (not by this workflow), GITHUB_TOKEN cannot
+# push to it — packages created outside Actions aren't auto-linked to
+# the repo. The fix is in `infra/terraform/README.md` "Bring-up": let
+# this workflow's first run create the package; don't push manually.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # push to GHCR via GITHUB_TOKEN
+  id-token: write   # request OIDC token for AWS STS
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image URI
+        id: image
+        run: |
+          repo_lc=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          sha_short=$(echo "${{ github.sha }}" | cut -c1-12)
+          echo "registry=ghcr.io/${repo_lc}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${sha_short}"        >> "$GITHUB_OUTPUT"
+          echo "uri=ghcr.io/${repo_lc}:sha-${sha_short}" >> "$GITHUB_OUTPUT"
+
+      # QEMU lets the x86_64 runner build a linux/arm64 image. Slower
+      # than native (~3-4 min vs ~50s) but works on the default free
+      # runner. Switch to `runs-on: ubuntu-24.04-arm` and drop the
+      # qemu setup to roughly 5x the build speed.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.registry }}:${{ steps.image.outputs.tag }}
+            ${{ steps.image.outputs.registry }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Pull the live task definition, strip read-only fields that
+      # `register-task-definition` rejects, and pass it to the render
+      # step. Doing this dynamically (vs storing a JSON in the repo)
+      # means env-var / secret changes from `terraform apply` are
+      # picked up on the next deploy without a manual sync step.
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+              --task-definition "${{ vars.ECS_TASK_FAMILY }}" \
+            | jq '.taskDefinition
+                  | del(.taskDefinitionArn, .revision, .status,
+                        .requiresAttributes, .compatibilities,
+                        .registeredAt, .registeredBy)' \
+            > task-definition.json
+
+      - name: Render task definition with new image
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ vars.ECS_CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true

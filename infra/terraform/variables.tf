@@ -12,7 +12,19 @@ variable "region" {
 
 variable "container_image" {
   type        = string
-  description = "Fully-qualified container image for the ECS task, e.g. `123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/orch:latest`. Build with the repo Dockerfile (`docker buildx build --platform linux/arm64 .`) and push to the ECR repo this module creates BEFORE running `terraform apply` against the ECS service (ECS will fail to pull a non-existent image)."
+  default     = null
+  description = "Optional override for the bootstrap container image. Defaults to `ghcr.io/<github_repo>:latest`. The deploy workflow registers SHA-pinned revisions after the initial apply, so this only affects the very first task-definition revision."
+}
+
+variable "github_repo" {
+  type        = string
+  description = "GitHub repo in `owner/name` form (e.g. `nigeldunn/engine`). Used to (a) construct the default GHCR image URL and (b) scope the OIDC trust policy on the deploy IAM role to this repo. Case-insensitive for GHCR; the OIDC sub claim is case-sensitive against the repo path GitHub uses."
+}
+
+variable "github_oidc_branch" {
+  type        = string
+  default     = "main"
+  description = "Branch the OIDC role trusts for deploys. Set to `*` to trust any ref on the repo (less safe, but useful for tag-based deploys or PR-driven workflows)."
 }
 
 variable "task_cpu" {

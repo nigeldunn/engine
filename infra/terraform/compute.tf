@@ -1,18 +1,13 @@
-# ECR + ECS cluster + IAM + task definition + service.
+# ECS cluster + IAM + task definition + service.
 #
-# Single-task Fargate ARM64. Stage E's Dockerfile is what feeds this:
-# `docker buildx build --platform linux/arm64 -t <ecr-uri>:latest .`
-# then `docker push <ecr-uri>:latest` BEFORE `terraform apply` (the
-# service will fail to pull a non-existent image).
-
-resource "aws_ecr_repository" "orch" {
-  name                 = local.name
-  image_tag_mutability = "MUTABLE"
-
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-}
+# Single-task Fargate ARM64. The container image is pulled from GHCR
+# (the repo's GitHub Container Registry namespace). The package must be
+# public, or ECS needs `repositoryCredentials` wired to a Secrets
+# Manager secret holding `{"username":..,"password":..}`. The
+# `.github/workflows/deploy.yml` pipeline owns image builds + pushes
+# and registers new task-definition revisions; this Terraform owns the
+# bootstrap revision (image tag is `:latest` until the first workflow
+# deploy pins a SHA).
 
 resource "aws_ecs_cluster" "this" {
   name = "${local.name}-cluster"
@@ -30,8 +25,9 @@ resource "aws_cloudwatch_log_group" "task" {
 
 # ── IAM ──────────────────────────────────────────────────────────────
 
-# Execution role: ECS uses this to pull from ECR, write to CloudWatch
-# Logs, and inject secrets from Secrets Manager into task env vars.
+# Execution role: ECS uses this to write to CloudWatch Logs and inject
+# secrets from Secrets Manager into task env vars. (No registry-pull
+# permissions needed — GHCR public images are fetched anonymously.)
 data "aws_iam_policy_document" "task_assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -102,7 +98,7 @@ resource "aws_ecs_task_definition" "orch" {
 
   container_definitions = jsonencode([{
     name      = local.name
-    image     = var.container_image
+    image     = local.container_image
     essential = true
 
     portMappings = [{
