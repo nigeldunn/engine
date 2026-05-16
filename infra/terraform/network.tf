@@ -72,7 +72,7 @@ resource "aws_route_table_association" "private" {
 # private subnets; this SG fronts it and gates ingress to the task SG.
 resource "aws_security_group" "vpclink" {
   name        = "${local.name}-vpclink"
-  description = "API Gateway VPC Link → ECS task"
+  description = "API Gateway VPC Link to ECS task"
   vpc_id      = aws_vpc.this.id
 
   egress {
