@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use hmac::{Hmac, Mac};
-use orchestrator_app::server::{build_health_router, build_webhook_router};
+use orchestrator_app::server::{build_health_router, build_ingest_router, build_webhook_router};
 use orchestrator_coding_workflow::WorkflowReducer;
 use orchestrator_core::test_support::{fresh_storage, DbGuard};
 use orchestrator_core::{Executor, WorkflowId};
@@ -292,4 +292,83 @@ async fn healthz_rejects_non_get() {
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+const INGEST_BEARER: &str = "merged-router-test-bearer";
+
+/// Mirror of the merge composition `run_webhook` performs at boot, so the
+/// test exercises the same router shape the production listener serves.
+fn merged_router(
+    exec: Arc<Executor<WorkflowReducer>>,
+    wake: Arc<Notify>,
+) -> axum::Router {
+    let webhook = build_webhook_router(
+        SECRET.into(),
+        exec.clone(),
+        TEST_BUDGET,
+        TEST_BACKOFF,
+        wake.clone(),
+    );
+    let ingest = build_ingest_router(Some(INGEST_BEARER.into()), exec, wake);
+    build_health_router().merge(webhook).merge(ingest)
+}
+
+/// Merged router: `POST /tickets` with the matching bearer reaches the
+/// ingest handler and creates the workflow. Validates that the route
+/// composition in `run_webhook` correctly co-mounts the ingest router
+/// alongside `/webhook` and `/healthz` on one listener (AWS ECS
+/// serviceRegistries cap = 1 forces this single-listener shape).
+#[tokio::test]
+async fn merged_router_serves_tickets_with_bearer() {
+    let (exec, _db) = fixture().await;
+    let router = merged_router(exec.clone(), Arc::new(Notify::new()));
+
+    let body = serde_json::to_vec(&json!({
+        "ticket": { "source": "manual", "id": "ENG-merge-1" },
+        "repo": { "owner": "octo", "name": "world" },
+        "base_branch": "main",
+        "base_sha": "0123456789abcdef0123456789abcdef01234567",
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .uri("/tickets")
+        .method("POST")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {INGEST_BEARER}"))
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let events = exec
+        .storage()
+        .read_events(&WorkflowId::new("manual:ENG-merge-1"))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload_type, "workflow.ticket_ingested.v1");
+}
+
+/// Merged router: `/tickets` without the bearer returns 401 — the
+/// ingest auth check is per-handler and survives composition.
+#[tokio::test]
+async fn merged_router_tickets_rejects_missing_bearer() {
+    let (exec, _db) = fixture().await;
+    let router = merged_router(exec, Arc::new(Notify::new()));
+
+    let body = serde_json::to_vec(&json!({
+        "ticket": { "source": "manual", "id": "ENG-merge-2" },
+        "repo": { "owner": "octo", "name": "world" },
+        "base_branch": "main",
+        "base_sha": "0123456789abcdef0123456789abcdef01234567",
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .uri("/tickets")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

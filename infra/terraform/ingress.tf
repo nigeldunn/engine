@@ -64,6 +64,24 @@ resource "aws_apigatewayv2_route" "healthz" {
   target    = "integrations/${aws_apigatewayv2_integration.task.id}"
 }
 
+# `/tickets` shares the existing integration. ECS service-registries are
+# capped at 1 per service, so we can't expose a second container port via
+# Cloud Map; instead the engine merges the ingest router into the webhook
+# listener on port 8080 (see `server.rs::run_webhook`).
+#
+# Authn is on the engine, not API Gateway: the ingest handler enforces
+# `Authorization: Bearer <token>` constant-time against the secret
+# injected as ORCH_SERVER__INGEST__BEARER_TOKEN__INLINE.
+#
+# The 10s integration timeout above is shared. Aurora cold-wake can push
+# the first ingest past that; if it bites we either bump this integration
+# to 29s (API GW HTTP API ceiling) or pre-warm with `min_capacity = 0.5`.
+resource "aws_apigatewayv2_route" "tickets" {
+  api_id    = aws_apigatewayv2_api.this.id
+  route_key = "POST /tickets"
+  target    = "integrations/${aws_apigatewayv2_integration.task.id}"
+}
+
 resource "aws_apigatewayv2_stage" "default" {
   api_id      = aws_apigatewayv2_api.this.id
   name        = "$default"

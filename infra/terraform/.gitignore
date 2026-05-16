@@ -1,0 +1,19 @@
+# Local provider cache; recreated by `terraform init`.
+.terraform/
+
+# State files contain plaintext secrets (RDS master password) and
+# environment-specific resource IDs. Never commit.
+*.tfstate
+*.tfstate.*
+
+# Variable files often hold sensitive overrides. Pass vars on the CLI
+# or via env (`TF_VAR_*`) instead.
+*.tfvars
+*.tfvars.json
+
+# Provider crash dumps.
+crash.log
+crash.*.log
+
+# Plan output files (may contain sensitive values too).
+*.tfplan

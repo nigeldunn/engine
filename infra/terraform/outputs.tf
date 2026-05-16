@@ -8,6 +8,11 @@ output "healthz_url" {
   value       = "${aws_apigatewayv2_api.this.api_endpoint}/healthz"
 }
 
+output "tickets_url" {
+  description = "Public ingest endpoint. POST a TicketIngested JSON body with `Authorization: Bearer <token>` (from orch/ingest-bearer-token) to trigger a workflow. Body example: {\"ticket\":{\"source\":\"manual\",\"id\":\"ENG-1\"},\"repo\":{\"owner\":\"o\",\"name\":\"r\"},\"base_branch\":\"main\",\"base_sha\":\"<40-hex>\"}."
+  value       = "${aws_apigatewayv2_api.this.api_endpoint}/tickets"
+}
+
 output "aurora_writer_endpoint" {
   description = "Aurora cluster writer endpoint (internal). Useful when constructing `ORCH_STORAGE__DATABASE_URL` for the operator-managed secret."
   value       = aws_rds_cluster.this.endpoint

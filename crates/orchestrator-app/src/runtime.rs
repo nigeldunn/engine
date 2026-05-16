@@ -238,11 +238,16 @@ impl Runtime {
                 Duration::from_millis(cfg.server.webhook.lookup_retry_budget_ms);
             let retry_backoff =
                 Duration::from_millis(cfg.server.webhook.lookup_retry_backoff_ms);
+            // Clone the ingest bearer for the merged ingest router on this
+            // listener; the original moves into `run_ingest` below for the
+            // loopback listener.
+            let ingest_token = ingest_bearer_token.clone();
             tokio::spawn(async move {
                 server::run_webhook(
                     webhook_listener,
                     prefix,
                     webhook_secret,
+                    ingest_token,
                     executor,
                     retry_budget,
                     retry_backoff,

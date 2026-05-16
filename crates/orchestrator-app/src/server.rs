@@ -75,36 +75,51 @@ pub fn build_health_router() -> Router {
 // `RetryPolicy` wrapper would just hide them. Localized allow is
 // cheaper than the abstractions.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(listener, executor, secret, wake, shutdown), fields(prefix = %path_prefix))]
+#[instrument(
+    skip(listener, executor, secret, ingest_bearer_token, wake, shutdown),
+    fields(prefix = %path_prefix)
+)]
 pub async fn run_webhook(
     listener: TcpListener,
     path_prefix: String,
     secret: String,
+    ingest_bearer_token: Option<String>,
     executor: Arc<Executor<WorkflowReducer>>,
     lookup_retry_budget: Duration,
     lookup_retry_backoff: Duration,
     wake: Arc<Notify>,
     shutdown: Arc<Notify>,
 ) -> Result<(), ServerError> {
-    let inner = build_webhook_router(
+    let webhook_inner = build_webhook_router(
         secret,
-        executor,
+        executor.clone(),
         lookup_retry_budget,
         lookup_retry_backoff,
-        wake,
+        wake.clone(),
     );
+    // `/tickets` is also merged here so a single public listener serves
+    // the full external surface (webhook, ingest, healthz). The handler
+    // enforces bearer-token auth constant-time inside `handle_ingest`
+    // (separate state from the webhook router), so co-mounting can't
+    // bridge the HMAC and bearer paths. AWS-side reason: ECS
+    // serviceRegistries are capped at 1 per service, so we can't expose
+    // a second container port via Cloud Map + API Gateway VPC Link; the
+    // standalone `run_ingest` listener still binds (loopback by default)
+    // for tests and operator shells.
+    let ingest_inner = build_ingest_router(ingest_bearer_token, executor, wake);
+
     // `/healthz` is merged at the root regardless of the webhook
-    // `path_prefix` so health probes have a stable path. The two
-    // routers can't conflict — webhook traffic lives under
-    // `path_prefix` (or `/` when empty, but the github router only
-    // handles its own POST endpoints, not GET /healthz).
-    let router = build_health_router().merge(
-        if path_prefix.is_empty() || path_prefix == "/" {
-            inner
+    // `path_prefix` so health probes have a stable path. `/tickets`
+    // also lives at the root — the path-prefix is a webhook-specific
+    // concept (matches what GitHub posts to) and doesn't apply to
+    // operator-facing ingest.
+    let router = build_health_router()
+        .merge(if path_prefix.is_empty() || path_prefix == "/" {
+            webhook_inner
         } else {
-            axum::Router::new().nest(&path_prefix, inner)
-        },
-    );
+            axum::Router::new().nest(&path_prefix, webhook_inner)
+        })
+        .merge(ingest_inner);
 
     info!("webhook server listening");
     axum::serve(listener, router)
