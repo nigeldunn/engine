@@ -28,8 +28,8 @@ use orchestrator_coding_workflow::{
 };
 use orchestrator_core::{
     ActionId, AttemptOutcome, Causation, ClaimedAction, Dispatcher,
-    DispatcherConfig as CoreDispatcherConfig, DispatcherError, EventCommand, Executor, Sink,
-    WorkflowId,
+    DispatcherConfig as CoreDispatcherConfig, DispatcherError, EventCommand, Executor, Reducer,
+    Sink, WorkflowId,
 };
 use orchestrator_github::{
     branch_ensured_event, commit_pushed_event, decode_commit_patch, decode_ensure_branch,
@@ -406,4 +406,159 @@ async fn happy_path_drives_through_to_merged() {
         .expect("dispatcher must drain within 5s")
         .expect("dispatcher task must not panic")
         .expect("dispatcher must return Ok");
+}
+
+// ── fixture-replay PoC (Helix v2 Phase -1, item 4) ───────────────────────
+//
+// Proves the determinism primitive the Helix Run Manifest depends on: the
+// reducer is pure and the event log is immutable + sequenced, so independently
+// re-folding the recorded events from `WorkflowState::default()` reproduces the
+// stored snapshot exactly. This is the v1-data confirmation that the
+// fixture-replay spike (docs/phase-minus-1/fixture-replay-spike.md) said was
+// "designed to support, unproven until PoC".
+//
+// We compare via `serde_json::to_value` rather than `==` so the test does not
+// depend on `WorkflowState: PartialEq`, and we run the fold twice to show the
+// fold itself (state + derived actions) is bit-for-bit reproducible.
+
+/// Fold every recorded event from default state, returning the final state and
+/// the per-event derived actions (as JSON, for equality without PartialEq).
+fn refold(
+    reducer: &WorkflowReducer,
+    events: &[orchestrator_core::EventEnvelope],
+) -> (WorkflowState, Vec<serde_json::Value>) {
+    let mut state = WorkflowState::default();
+    let mut derived = Vec::with_capacity(events.len());
+    for event in events {
+        state = reducer.reduce(state, event).expect("reduce must not fail");
+        let actions = reducer
+            .derive_actions(&state, event)
+            .expect("derive_actions must not fail");
+        derived.push(serde_json::to_value(&actions).expect("actions serialise"));
+    }
+    (state, derived)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deterministic_refold_matches_snapshot() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (storage, _db) = orchestrator_core::test_support::fresh_storage().await;
+    let executor = Arc::new(Executor::new(storage, WorkflowReducer));
+
+    let mut dispatcher = Dispatcher::new(
+        executor.clone(),
+        CoreDispatcherConfig {
+            poll_interval: Duration::from_millis(20),
+            health_check_interval: Duration::from_secs(60),
+            ..Default::default()
+        },
+    );
+    dispatcher.register(AgentRunnerSink::new(StubAgentClient));
+    dispatcher.register(StubGithubSink);
+    let shutdown = dispatcher.shutdown_handle();
+    let dispatcher_join = tokio::spawn(dispatcher.run());
+
+    let workflow_id = WorkflowId::new("manual:REFOLD-1");
+
+    ingest_ticket(
+        &executor,
+        IngestRequest {
+            workflow_id: None,
+            ticket_ingested: TicketIngested {
+                ticket: TicketRef {
+                    source: "manual".into(),
+                    id: "REFOLD-1".into(),
+                },
+                repo: RepoRef {
+                    owner: "octo".into(),
+                    name: "world".into(),
+                },
+                base_branch: "main".into(),
+                base_sha: STUB_HEAD_SHA.into(),
+                cost_budget_cents: Some(1_000_000),
+                require_architecture_review: false,
+            },
+        },
+    )
+    .await
+    .expect("ingest");
+
+    poll_until_event(
+        &executor,
+        &workflow_id,
+        "github.pr_opened.v1",
+        Duration::from_secs(15),
+    )
+    .await;
+
+    executor
+        .advance(EventCommand {
+            workflow_id: workflow_id.clone(),
+            payload_type: EVT_PR_MERGED.into(),
+            payload_schema_version: 1,
+            payload: json!({
+                "repo": { "owner": "octo", "name": "world" },
+                "pr_number": STUB_PR_NUMBER,
+                "merge_commit_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            }),
+            causation: Causation::External {
+                source: "refold_test".into(),
+                request_id: "merge-1".into(),
+            },
+            trace_id: None,
+            ingress_dedup_key: Some("merge-1".into()),
+        })
+        .await
+        .expect("synthesize PrMerged");
+
+    poll_until_event(&executor, &workflow_id, EVT_PR_MERGED, Duration::from_secs(5)).await;
+
+    // Stop the dispatcher so no further events are written while we read.
+    shutdown.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher_join)
+        .await
+        .expect("dispatcher must drain within 5s")
+        .expect("dispatcher task must not panic")
+        .expect("dispatcher must return Ok");
+
+    // The recorded, immutable event log.
+    let events = executor
+        .storage()
+        .read_events(&workflow_id)
+        .await
+        .expect("read_events");
+    assert!(
+        events.len() >= 10,
+        "expected a full happy-path log, got {} events",
+        events.len()
+    );
+
+    let reducer = WorkflowReducer;
+
+    // (1) The fold is itself deterministic: two independent passes agree on
+    //     both the final state and every per-event derived-action set.
+    let (state_a, derived_a) = refold(&reducer, &events);
+    let (state_b, derived_b) = refold(&reducer, &events);
+    let json_a = serde_json::to_value(&state_a).unwrap();
+    let json_b = serde_json::to_value(&state_b).unwrap();
+    assert_eq!(json_a, json_b, "re-fold is not deterministic across passes");
+    assert_eq!(
+        derived_a, derived_b,
+        "derived actions are not deterministic across passes"
+    );
+
+    // (2) The key claim: re-folding the event log from default state reproduces
+    //     the snapshot the engine persisted live.
+    let snapshot = read_workflow_state(&executor, &workflow_id)
+        .await
+        .expect("snapshot must exist");
+    let snapshot_json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(
+        json_a, snapshot_json,
+        "re-folded state diverged from the persisted snapshot",
+    );
+
+    // (3) Sanity: the deterministic re-fold reaches the terminal state.
+    assert_eq!(state_a.status, WorkflowStatus::Merged);
 }
